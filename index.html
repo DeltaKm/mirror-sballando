@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mirror@Sballando</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: black;
+        }
+        video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+        @media (orientation: landscape) {
+            video {
+                width: auto;
+                height: 100vh;
+                left: 50%;
+                transform: translateX(-50%);
+            }
+        }
+    </style>
+</head>
+
+<div id="header" style="position: fixed;color: white;background-color: rgb(0 0 0 / 15%);height: 36px;z-index: 9;top: 0;width: 100%;/* text-align: center; */font-size: 25px;font-family: monospace;padding: 5px 0 0 0;text-align: center;display: none;">
+</div>
+<div id="tool" style="position: fixed;color: white;background-color: rgb(216 216 216);height: 290px;z-index: 9;bottom: 55px;width: 50%;/* text-align: center; */font-size: 18px;font-family: monospace;margin: 0px 0 8px 6px;border-radius: 15px;padding: 9px;display:none;">Test</div>
+<div id="caption" style="position: fixed;color: white;background-color: rgb(0 0 0 / 15%);height: 36px;z-index: 9;bottom: 0;width: 100%;/* text-align: center; */font-size: 18px;font-family: monospace;padding: 16px 0 0 0;">
+    <img src="sballando-logo.svg" style="height: 30px;float: left;margin: -6px 20px 0 61px;">
+    <div>© 2025 | www.sballando.it | info@sballando.it</div>
+</div>
+<body onclick="open_mirror();">
+    <video autoplay muted loop playsinline>
+        <source src="video_2025-09-16_15-37-56.mp4" type="video/mp4">
+        Il tuo browser non supporta il tag video.
+    </video>
+    <script type="text/javascript">
+        
+        var url_ = new URL(window.location.href);
+        var EVENT_ID = url_.searchParams.get('id');
+
+
+        FETCH(
+            'https://webservice.sballando.it/api/event/show',
+            EVENT_ID,
+            function(content){
+                console.log(content);
+                var event = content.event;
+                var title = event.title;
+                document.getElementById("header").innerHTML = title;
+                document.getElementById("header").style.display = "block";
+            }
+        );
+
+        function FETCH(url,event_id,callback_success,callback_fail) {
+            if(!callback_success) callback_success = function(){};
+            if(!callback_fail) callback_fail = function(){};
+            fetch(url, {method: 'POST',headers: {'Content-Type': 'application/json'},body: JSON.stringify({event_id: event_id})}).then(response => response.json()).then(data => {callback_success(data);}).catch(error => {callback_fail(error);});
+        }
+        function formattaData(dataString) {
+          const data = new Date(dataString);
+          const giorno = String(data.getDate()).padStart(2, '0');
+          const mese = String(data.getMonth() + 1).padStart(2, '0');
+          const anno = data.getFullYear();
+          const ore = String(data.getHours()).padStart(2, '0');
+          const minuti = String(data.getMinutes()).padStart(2, '0');
+          return `${giorno}/${mese}/${anno} ${ore}:${minuti}`;
+        }
+
+        function open_mirror() {
+            window.open("index2.html?id="+EVENT_ID,"_self");
+        }
+
+    </script>
+</body>
+</html>
