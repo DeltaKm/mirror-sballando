@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: 'Manrope', 'Segoe UI', 'SF Pro Text', sans-serif;
+  background: #08090c;
+}
+
+.app-shell-bg {
+  background: radial-gradient(circle at top right, #2d2d2d 0%, #111 45%, #0a0a0a 100%);
+}
+
+.kiosk-premium-bg {
+  background:
+    radial-gradient(900px 600px at 85% 10%, rgba(255, 71, 102, 0.22), transparent 60%),
+    radial-gradient(700px 500px at 15% 92%, rgba(101, 116, 255, 0.16), transparent 60%),
+    linear-gradient(160deg, #07080d 0%, #0d0f16 42%, #0a0a0c 100%);
+}

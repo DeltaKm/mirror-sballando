@@ -1,0 +1,12 @@
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\bin\Debug\net8.0\PrintBroker.Domain.deps.json
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\bin\Debug\net8.0\PrintBroker.Domain.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\bin\Debug\net8.0\PrintBroker.Domain.pdb
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.GeneratedMSBuildEditorConfig.editorconfig
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.AssemblyInfoInputs.cache
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.AssemblyInfo.cs
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.csproj.CoreCompileInputs.cache
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.sourcelink.json
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\refint\PrintBroker.Domain.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\PrintBroker.Domain.pdb
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Domain\obj\Debug\net8.0\ref\PrintBroker.Domain.dll

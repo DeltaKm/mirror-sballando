@@ -5,10 +5,23 @@ dist/
 release/
 out/
 build/
+.vite/
 
 # Runtime/output data
 Foto/
 temp.html
+storage/photos/*
+storage/previews/*
+storage/prints/*
+storage/logs/*
+storage/cache/*
+storage/mirror.db*
+!storage/photos/.gitkeep
+!storage/previews/.gitkeep
+!storage/prints/.gitkeep
+!storage/templates/.gitkeep
+!storage/logs/.gitkeep
+!storage/cache/.gitkeep
 
 # Logs
 *.log
@@ -27,3 +40,9 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Build output
+bin/
+obj/
+*.user
+
