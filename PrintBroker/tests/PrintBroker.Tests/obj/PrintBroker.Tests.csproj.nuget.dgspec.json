@@ -1,0 +1,335 @@
+{
+  "format": 1,
+  "restore": {
+    "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\tests\\PrintBroker.Tests\\PrintBroker.Tests.csproj": {}
+  },
+  "projects": {
+    "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\PrintBroker.Api.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\PrintBroker.Api.csproj",
+        "projectName": "PrintBroker.Api",
+        "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\PrintBroker.Api.csproj",
+        "packagesPath": "C:\\Users\\Utente\\.nuget\\packages\\",
+        "outputPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Utente\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj": {
+                "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj"
+              },
+              "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\PrintBroker.Infrastructure.csproj": {
+                "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\PrintBroker.Infrastructure.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "Microsoft.EntityFrameworkCore.Design": {
+              "include": "Runtime, Build, Native, ContentFiles, Analyzers, BuildTransitive",
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[8.0.8, )"
+            },
+            "Serilog.AspNetCore": {
+              "target": "Package",
+              "version": "[8.0.2, )"
+            },
+            "Serilog.Settings.Configuration": {
+              "target": "Package",
+              "version": "[8.0.2, )"
+            },
+            "Serilog.Sinks.File": {
+              "target": "Package",
+              "version": "[5.0.0, )"
+            },
+            "Swashbuckle.AspNetCore": {
+              "target": "Package",
+              "version": "[6.6.2, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.AspNetCore.App": {
+              "privateAssets": "none"
+            },
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WindowsForms": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Users\\Utente\\.dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj",
+        "projectName": "PrintBroker.Domain",
+        "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj",
+        "packagesPath": "C:\\Users\\Utente\\.nuget\\packages\\",
+        "outputPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Utente\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Users\\Utente\\.dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\PrintBroker.Infrastructure.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\PrintBroker.Infrastructure.csproj",
+        "projectName": "PrintBroker.Infrastructure",
+        "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\PrintBroker.Infrastructure.csproj",
+        "packagesPath": "C:\\Users\\Utente\\.nuget\\packages\\",
+        "outputPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Infrastructure\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Utente\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj": {
+                "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "Microsoft.EntityFrameworkCore": {
+              "target": "Package",
+              "version": "[8.0.8, )"
+            },
+            "Microsoft.EntityFrameworkCore.Sqlite": {
+              "target": "Package",
+              "version": "[8.0.8, )"
+            },
+            "System.Drawing.Common": {
+              "target": "Package",
+              "version": "[8.0.8, )"
+            },
+            "System.Management": {
+              "target": "Package",
+              "version": "[8.0.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WindowsForms": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Users\\Utente\\.dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\tests\\PrintBroker.Tests\\PrintBroker.Tests.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\tests\\PrintBroker.Tests\\PrintBroker.Tests.csproj",
+        "projectName": "PrintBroker.Tests",
+        "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\tests\\PrintBroker.Tests\\PrintBroker.Tests.csproj",
+        "packagesPath": "C:\\Users\\Utente\\.nuget\\packages\\",
+        "outputPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\tests\\PrintBroker.Tests\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Utente\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\PrintBroker.Api.csproj": {
+                "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Api\\PrintBroker.Api.csproj"
+              },
+              "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj": {
+                "projectPath": "E:\\Mirror Sballando\\mirror-sballando\\PrintBroker\\src\\PrintBroker.Domain\\PrintBroker.Domain.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "Microsoft.Extensions.Options": {
+              "target": "Package",
+              "version": "[8.0.2, )"
+            },
+            "Microsoft.NET.Test.Sdk": {
+              "target": "Package",
+              "version": "[17.11.1, )"
+            },
+            "coverlet.collector": {
+              "include": "Runtime, Build, Native, ContentFiles, Analyzers, BuildTransitive",
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[6.0.2, )"
+            },
+            "xunit": {
+              "target": "Package",
+              "version": "[2.9.1, )"
+            },
+            "xunit.runner.visualstudio": {
+              "include": "Runtime, Build, Native, ContentFiles, Analyzers, BuildTransitive",
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[2.8.2, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Users\\Utente\\.dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

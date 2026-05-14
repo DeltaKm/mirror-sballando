@@ -1,0 +1,16 @@
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\bin\Debug\net8.0-windows\PrintBroker.Infrastructure.deps.json
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\bin\Debug\net8.0-windows\PrintBroker.Infrastructure.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\bin\Debug\net8.0-windows\PrintBroker.Infrastructure.pdb
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\bin\Debug\net8.0-windows\PrintBroker.Domain.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\bin\Debug\net8.0-windows\PrintBroker.Domain.pdb
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.csproj.AssemblyReference.cache
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.GeneratedMSBuildEditorConfig.editorconfig
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.AssemblyInfoInputs.cache
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.AssemblyInfo.cs
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.csproj.CoreCompileInputs.cache
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.sourcelink.json
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBro.7C060670.Up2Date
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\refint\PrintBroker.Infrastructure.dll
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\PrintBroker.Infrastructure.pdb
+E:\Mirror Sballando\mirror-sballando\PrintBroker\src\PrintBroker.Infrastructure\obj\Debug\net8.0-windows\ref\PrintBroker.Infrastructure.dll
