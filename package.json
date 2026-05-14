@@ -1,0 +1,53 @@
+{
+  "name": "mirror_sballando",
+  "version": "1.0.0",
+  "description": "Mirror Sballando - photobooth desktop app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron main.js",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "author": "Valerio Poetico",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^38.1.0",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {
+    "ssh2-sftp-client": "^12.0.1"
+  },
+  "build": {
+    "appId": "it.valpoe.mirrorsballando",
+    "productName": "Mirror Sballando",
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "win": {
+      "icon": "favicon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "favicon.ico",
+      "favicon.png",
+      "package.json"
+    ],
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Mirror Sballando",
+      "installerIcon": "favicon.ico",
+      "uninstallerIcon": "favicon.ico",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

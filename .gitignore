@@ -1,0 +1,48 @@
+node_modules/
+
+# Build artifacts
+dist/
+release/
+out/
+build/
+.vite/
+
+# Runtime/output data
+Foto/
+temp.html
+storage/photos/*
+storage/previews/*
+storage/prints/*
+storage/logs/*
+storage/cache/*
+storage/mirror.db*
+!storage/photos/.gitkeep
+!storage/previews/.gitkeep
+!storage/prints/.gitkeep
+!storage/templates/.gitkeep
+!storage/logs/.gitkeep
+!storage/cache/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build output
+bin/
+obj/
+*.user
+

@@ -1,0 +1,276 @@
+body {
+    margin: 0;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    background-color: black;
+    color: white;
+    font-family: sans-serif;
+}
+#videoContainer {
+    position: relative;
+    width: 1200px;
+    height: 1920px;
+    overflow: hidden;
+    background-color: black;
+    display: flex; /* Centra i figli */
+    justify-content: center;
+    align-items: center;
+}
+#video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transform: scaleX(1); /* Allarga lateralmente del 20%, regola se necessario */
+}
+#frameOverlay1 {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1200px; /* Dimensioni esatte della cornice */
+    height: 1920px;
+    pointer-events: none; /* Permette clic sui controlli */
+    z-index: 5; /* Sotto i controlli ma sopra il video */
+}
+#frameOverlay2 {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1200px; /* Dimensioni esatte della cornice */
+    height: 1920px;
+    pointer-events: none; /* Permette clic sui controlli */
+    z-index: 5; /* Sotto i controlli ma sopra il video */
+    display: none;
+}
+#frameOverlay3 {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1200px; /* Dimensioni esatte della cornice */
+    height: 1920px;
+    pointer-events: none; /* Permette clic sui controlli */
+    z-index: 5; /* Sotto i controlli ma sopra il video */
+    display: none;
+}
+#frameOverlay4 {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1200px; /* Dimensioni esatte della cornice */
+    height: 1920px;
+    pointer-events: none; /* Permette clic sui controlli */
+    z-index: 5; /* Sotto i controlli ma sopra il video */
+    display: none;
+}
+#frameOverlay5 {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1200px; /* Dimensioni esatte della cornice */
+    height: 1920px;
+    pointer-events: none; /* Permette clic sui controlli */
+    z-index: 5; /* Sotto i controlli ma sopra il video */
+    display: none;
+}
+#canvas {
+    display: none;
+}
+#controls {
+    position: absolute;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: rgb(218 68 83);
+    padding: 10px;
+    border-radius: 5px;
+    z-index: 10; /* Sopra la cornice */
+    display: none;
+    height: 380px;
+}
+button {
+    margin: 5px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    background-color: #fff;
+    border: none;
+    border-radius: 5px;
+}
+select {
+    margin: 5px;
+    padding: 8px;
+    font-size: 14px;
+    border-radius: 5px;
+}
+/* Assicura che il layout resti centrato in fullscreen */
+:fullscreen #videoContainer,
+:-webkit-full-screen #videoContainer,
+:-moz-full-screen #videoContainer,
+:-ms-fullscreen #videoContainer {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+}
+:fullscreen #frameOverlay1,
+:-webkit-full-screen #frameOverlay1,
+:-moz-full-screen #frameOverlay1,
+:-ms-fullscreen #frameOverlay1 {
+    left: 50%;
+    transform: translateX(-50%);
+}
+:fullscreen #frameOverlay2,
+:-webkit-full-screen #frameOverlay2,
+:-moz-full-screen #frameOverlay2,
+:-ms-fullscreen #frameOverlay2 {
+    left: 50%;
+    transform: translateX(-50%);
+}
+:fullscreen #frameOverlay3,
+:-webkit-full-screen #frameOverlay3,
+:-moz-full-screen #frameOverlay3,
+:-ms-fullscreen #frameOverlay3 {
+    left: 50%;
+    transform: translateX(-50%);
+}
+:fullscreen #frameOverlay4,
+:-webkit-full-screen #frameOverlay4,
+:-moz-full-screen #frameOverlay4,
+:-ms-fullscreen #frameOverlay4 {
+    left: 50%;
+    transform: translateX(-50%);
+}
+:fullscreen #frameOverlay5,
+:-webkit-full-screen #frameOverlay5,
+:-moz-full-screen #frameOverlay5,
+:-ms-fullscreen #frameOverlay5 {
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+#foto_temp {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: none;
+    background-color: #000000d6;
+    width: 100vw;
+    height: 100vh;
+    text-align: center;
+    overflow: hidden;
+}
+#foto_temp > img {
+    display: block;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.8);
+    max-width: 92vw;
+    max-height: 92vh;
+    box-shadow: 0px 0px 100px 2px rgba(255,255,255,0.75);
+    -webkit-box-shadow: 0px 0px 100px 2px rgba(255,255,255,0.75);
+    -moz-box-shadow: 0px 0px 13px 2px rgba(255,255,255,0.75);
+}
+
+#foto_temp_loading {
+    position: absolute;
+    width: 100%;
+    top: 750px;
+    font-size: 100px;
+    display: none;
+}
+
+#controls_user_temp {
+    z-index: 999999;
+    position: absolute;
+    bottom: 223px;
+    width: 100%;
+    text-align: center;
+}
+#controls_user_temp_cancel {
+    cursor: pointer;
+    margin: 0 100px 0 0;
+    width: 100px;
+}
+#controls_user_temp_ok {
+    cursor: pointer;
+    margin: 0 0 0 100px;
+    width: 100px;
+}
+#count_down {
+    position: absolute;
+    z-index: 99999;
+    font-size: 500px;
+    color: #ffffff6e;
+    display: none;
+}
+#controls_user {
+    z-index: 999999;
+    position: absolute;
+    bottom: 130px;
+}
+#toggle_cornici_left {
+    cursor: pointer;
+    margin: 0 15px 0 0;
+}
+#toggle_cornici_right {
+    cursor: pointer;
+    margin: 0 0 0 15px;
+}
+#cursor_camerashot {
+    cursor: pointer;
+}
+#escape_full {
+    position: absolute;
+    width: 100px;
+    height: 100px;
+    opacity: 0;
+    z-index: 999999999;
+    background: red;
+    bottom: 0;
+    left: 0;
+}
+#escape_full_screen {
+    position: absolute;
+    width: 100px;
+    height: 100px;
+    opacity: 0;
+    z-index: 999999999;
+    background: red;
+    top: 0;
+    right: 0;
+}
+#totem_escape_modal_exit_button {
+    cursor: pointer;
+    text-align: right;
+    margin: 7px 0 12px 0;
+}
+
+#totem_escape_modal_exit_button > span {
+    background-color: white;
+    color: #da4453;
+    padding: 7px 15px 8px 14px;
+    border-radius: 19px;
+}
+#escape_normal {
+    position: absolute;
+    width: 100px;
+    height: 100px;
+    opacity: 0;
+    z-index: 999999999;
+    background: red;
+    bottom: 0;
+    left: 0;
+}
