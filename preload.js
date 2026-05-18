@@ -41,6 +41,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   getSaveFolder: () => ipcRenderer.invoke('get-save-folder'),
   setCurrentEventFolder: (eventName) => ipcRenderer.invoke('set-current-event-folder', eventName),
+  getEventPhotos: (eventName) => ipcRenderer.invoke('get-event-photos', eventName),
+  resolveOriginalPhotoPath: (eventName, photoId) => ipcRenderer.invoke('resolve-original-photo-path', eventName, photoId),
   saveCapturedPhoto: (payload) => ipcRenderer.invoke('save-captured-photo', payload),
   setSaveFolder: (p) => ipcRenderer.invoke('set-save-folder', p),
   chooseSaveFolder: () => ipcRenderer.invoke('choose-save-folder'),
@@ -48,4 +50,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   pingWindowControls: () => true,
   setSessionMode: (active) => ipcRenderer.invoke('set-session-mode', active),
   navigateHome: () => ipcRenderer.invoke('navigate-home'),
+  listSystemPrinters: () => ipcRenderer.invoke('list-system-printers'),
+  getPrinterState: (force) => ipcRenderer.invoke('get-printer-state', !!force),
+  setSelectedPrinter: (name) => ipcRenderer.invoke('set-selected-printer', name),
+  getSelectedPrinter: () => ipcRenderer.invoke('get-selected-printer'),
+  getPrintCalibration: () => ipcRenderer.invoke('get-print-calibration'),
+  setPrintCalibration: (cal) => ipcRenderer.invoke('set-print-calibration', cal),
+  printTestPattern: (payload) => ipcRenderer.invoke('print-test-pattern', payload || {}),
+  onPrinterState: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const handler = (_event, state) => {
+      try { callback(state || null); } catch (_) {}
+    };
+    ipcRenderer.on('printer-state', handler);
+    return () => ipcRenderer.removeListener('printer-state', handler);
+  },
 });

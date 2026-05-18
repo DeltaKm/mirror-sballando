@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mirror Sballando</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0a0a0f;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;}
+  /* Controlli legacy nascosti ma presenti nel DOM */
+  #legacy-controls{position:absolute;left:-99999px;width:1px;height:1px;overflow:hidden;}
+  /* foto_temp: contenitore preview foto (il watchdog di ms-app lo rileva). */
+  #foto_temp{position:fixed;inset:0;z-index:9000;background:#000;display:none;align-items:center;justify-content:center;}
+  #foto_temp > img{max-width:100%;max-height:100%;object-fit:contain;}
+  #canvas{display:none;}
+</style>
+</head>
+<body>
+  <!-- Stub legacy: il pannello custom ms-app legge eventi/tempi/checkbox da qui. -->
+  <div id="legacy-controls">
+    <select name="event_selected" id="event_selected">
+      <option value="" selected>-- Seleziona un evento --</option>
+      <option value="1">Evento Demo 1 (01/01/2025 20:00)</option>
+      <option value="2">Matrimonio Rossi (15/02/2025 18:00)</option>
+      <option value="3">18 Anni Bianchi (10/03/2025 21:00)</option>
+      <option value="4">Festa Aziendale ACME (22/04/2025 19:30)</option>
+      <option value="5">Compleanno Verdi (05/05/2025 17:00)</option>
+      <option value="6">Battesimo Russo (20/06/2025 11:00)</option>
+      <option value="7">Comunione Esposito (07/07/2025 13:00)</option>
+      <option value="8">Capodanno 2026 (31/12/2025 22:00)</option>
+    </select>
+
+    <select name="count_down_selected" id="count_down_selected">
+      <option value="0">0</option>
+      <option value="3" selected>3</option>
+      <option value="5">5</option>
+      <option value="7">7</option>
+      <option value="10">10</option>
+    </select>
+
+    <select name="inactivity_selected" id="inactivity_selected">
+      <option value="1">1</option>
+      <option value="2" selected>2</option>
+      <option value="3">3</option>
+      <option value="4">4</option>
+      <option value="5">5</option>
+      <option value="6">6</option>
+      <option value="7">7</option>
+      <option value="8">8</option>
+      <option value="9">9</option>
+      <option value="10">10</option>
+    </select>
+
+    <input type="checkbox" name="sounds" id="sounds_chk" checked>
+    <input type="checkbox" name="print" id="print">
+
+    <!-- Audio per countdown/scatto/conferma. -->
+    <audio name="sound_shot" id="snd_shot" preload="auto"></audio>
+    <audio name="sound_1" id="snd_1" preload="auto"></audio>
+    <audio name="sound_2" id="snd_2" preload="auto"></audio>
+    <audio name="sound_3" id="snd_3" preload="auto"></audio>
+    <audio name="sound_4" id="snd_4" preload="auto"></audio>
+    <audio name="sound_5" id="snd_5" preload="auto"></audio>
+    <audio name="sound_ok" id="snd_ok" preload="auto"></audio>
+    <audio name="sound_confirm" id="snd_confirm" preload="auto"></audio>
+    <audio name="sound_cancel" id="snd_cancel" preload="auto"></audio>
+    <audio name="sound_click" id="snd_click" preload="auto"></audio>
+    <audio name="sound_save" id="snd_save" preload="auto"></audio>
+
+    <!-- cursor_ok: cliccato dal fallback di salvataggio per riprodurre il suono. -->
+    <img id="cursor_ok" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="">
+    <img id="cursor_cancel" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="">
+
+    <!-- Capture button + canvas (compatibilita' col flusso live shoot di ms-app). -->
+    <canvas id="canvas" width="1200" height="1800"></canvas>
+    <button id="captureBtn" type="button"></button>
+  </div>
+
+  <!-- Preview foto post-scatto. Il watchdog di ms-app la rileva e costruisce la UI sopra. -->
+  <div id="foto_temp"><img src="" alt=""></div>
+
+  <script>
+    (function () {
+      // ─── Audio: WAV beep di countdown e scatto ─────────────────────────────
+      function makeBeepDataUrl(opts) {
+        var sampleRate = 44100;
+        var dur = opts.dur || 0.18;
+        var samples = Math.floor(sampleRate * dur);
+        var buffer = new ArrayBuffer(44 + samples * 2);
+        var view = new DataView(buffer);
+        function wstr(off, s) { for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); }
+        wstr(0, 'RIFF');
+        view.setUint32(4, 36 + samples * 2, true);
+        wstr(8, 'WAVE'); wstr(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        wstr(36, 'data');
+        view.setUint32(40, samples * 2, true);
+        var freq = opts.freq || 880;
+        var freq2 = opts.freq2 || 0;
+        var amp = Math.max(0, Math.min(1, opts.vol || 0.6)) * 32767;
+        var attack = opts.attack || 0.004;
+        var release = opts.release || Math.min(0.05, dur * 0.4);
+        var noiseMix = opts.noise || 0;
+        for (var i = 0; i < samples; i++) {
+          var t = i / sampleRate;
+          var env = Math.min(1, t / attack) * Math.min(1, (dur - t) / release);
+          var s = Math.sin(2 * Math.PI * freq * t);
+          if (freq2) s = 0.5 * s + 0.5 * Math.sin(2 * Math.PI * freq2 * t);
+          if (noiseMix) s = (1 - noiseMix) * s + noiseMix * (Math.random() * 2 - 1);
+          var v = s * env * amp;
+          if (v > 32767) v = 32767; if (v < -32767) v = -32767;
+          view.setInt16(44 + i * 2, v, true);
+        }
+        var bytes = new Uint8Array(buffer);
+        var bin = '';
+        for (var j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+        return 'data:audio/wav;base64,' + btoa(bin);
+      }
+
+      var tick1 = makeBeepDataUrl({ freq: 1200, dur: 0.11, vol: 0.62, attack: 0.002, release: 0.045 });
+      var tick2 = makeBeepDataUrl({ freq: 1120, dur: 0.11, vol: 0.62, attack: 0.002, release: 0.045 });
+      var tick3 = makeBeepDataUrl({ freq: 1040, dur: 0.11, vol: 0.62, attack: 0.002, release: 0.045 });
+      var tick4 = makeBeepDataUrl({ freq: 960, dur: 0.11, vol: 0.62, attack: 0.002, release: 0.045 });
+      var tick5 = makeBeepDataUrl({ freq: 880, dur: 0.11, vol: 0.62, attack: 0.002, release: 0.045 });
+      var shotBeep = makeBeepDataUrl({ freq: 220, freq2: 440, dur: 0.22, vol: 0.85, attack: 0.002, release: 0.18, noise: 0.35 });
+      var okBeep = makeBeepDataUrl({ freq: 1320, freq2: 1760, dur: 0.12, vol: 0.7, attack: 0.003, release: 0.06 });
+      var cancelBeep = makeBeepDataUrl({ freq: 620, freq2: 520, dur: 0.10, vol: 0.62, attack: 0.002, release: 0.055 });
+      var clickBeep = makeBeepDataUrl({ freq: 980, dur: 0.08, vol: 0.55, attack: 0.002, release: 0.04 });
+
+      function setSrc(id, url) { var el = document.getElementById(id); if (el) { el.src = url; try { el.load(); } catch (_) {} el.volume = 1.0; } }
+      setSrc('snd_1', tick1);
+      setSrc('snd_2', tick2);
+      setSrc('snd_3', tick3);
+      setSrc('snd_4', tick4);
+      setSrc('snd_5', tick5);
+      setSrc('snd_shot', shotBeep);
+      setSrc('snd_ok', okBeep);
+      setSrc('snd_confirm', okBeep);
+      setSrc('snd_cancel', cancelBeep);
+      setSrc('snd_click', clickBeep);
+      setSrc('snd_save', okBeep);
+
+      // cursor_ok: click = suono di conferma salvataggio
+      var ok = document.getElementById('cursor_ok');
+      if (ok) {
+        ok.addEventListener('click', function () {
+          try { var a = document.getElementById('snd_ok'); if (a) { a.currentTime = 0; var p = a.play(); if (p && p.catch) p.catch(function(){}); } } catch (_) {}
+        });
+      }
+      var cancel = document.getElementById('cursor_cancel');
+      if (cancel) {
+        cancel.addEventListener('click', function () {
+          try { var a = document.getElementById('snd_cancel') || document.getElementById('snd_click'); if (a) { a.currentTime = 0; var p = a.play(); if (p && p.catch) p.catch(function(){}); } } catch (_) {}
+        });
+      }
+
+      // ─── Audio unlock: al primo gesto utente prepariamo tutti gli <audio> ─────
+      // muted + play + pause svuota la coda autoplay-policy. I successivi play()
+      // durante il countdown non vengono piu' rifiutati.
+      var __audioUnlocked = false;
+      function unlockAudio() {
+        if (__audioUnlocked) return;
+        __audioUnlocked = true;
+        try {
+          var audios = document.querySelectorAll('audio');
+          for (var i = 0; i < audios.length; i++) {
+            (function (a) {
+              try {
+                a.muted = true;
+                var p = a.play();
+                if (p && typeof p.then === 'function') {
+                  p.then(function () {
+                    try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {}
+                  }).catch(function () {});
+                }
+              } catch (_) {}
+            })(audios[i]);
+          }
+        } catch (_) {}
+      }
+      window.addEventListener('pointerdown', unlockAudio, { once: false, capture: true });
+      window.addEventListener('keydown', unlockAudio, { once: false, capture: true });
+
+      // ─── Capture: snapshot di ms-cam-video + cornice ───────────────────────
+      function showFotoTemp(url) {
+        var ft = document.getElementById('foto_temp');
+        var img = ft && ft.querySelector('img');
+        if (img) img.src = url;
+        if (ft) { ft.style.display = 'flex'; }
+      }
+
+      function resolveSelectedFrameUrl() {
+        try {
+          if (typeof window.__msResolveFrameUrl === 'function') {
+            var u = String(window.__msResolveFrameUrl() || '').trim();
+            if (u) return u;
+          }
+        } catch (_) {}
+        try {
+          var sel = localStorage.getItem('msSelectedFrameV1') || '';
+          var raw = localStorage.getItem('msLocalFramesV1') || '[]';
+          var frames = JSON.parse(raw);
+          if (!Array.isArray(frames)) return '';
+          for (var i = 0; i < frames.length; i++) {
+            if (!sel || frames[i].name === sel) return frames[i].url || '';
+          }
+          if (frames[0]) return frames[0].url || '';
+        } catch (_) {}
+        return '';
+      }
+
+      var TARGET_W = 1200, TARGET_H = 1800;
+
+      document.getElementById('captureBtn').addEventListener('click', function () {
+        try {
+          var video = document.getElementById('ms-cam-video');
+          var canvas = document.getElementById('canvas');
+          canvas.width = TARGET_W; canvas.height = TARGET_H;
+          var ctx = canvas.getContext('2d');
+
+          // Sfondo nero garantito (cosi' la foto non e' mai "trasparente"/vuota).
+          ctx.fillStyle = '#000';
+          ctx.fillRect(0, 0, TARGET_W, TARGET_H);
+
+          var vw = (video && video.videoWidth) | 0;
+          var vh = (video && video.videoHeight) | 0;
+          var readyState = video ? video.readyState : -1;
+          console.log('[local-capture] video=' + !!video + ' vw=' + vw + ' vh=' + vh + ' rs=' + readyState + ' paused=' + (video && video.paused));
+
+          if (video && video.paused) {
+            try { var pp = video.play(); if (pp && pp.catch) pp.catch(function(){}); } catch (_) {}
+          }
+
+          if (video && vw > 0 && vh > 0) {
+            var targetAR = TARGET_W / TARGET_H, videoAR = vw / vh;
+            var sx = 0, sy = 0, sw = vw, sh = vh;
+            if (videoAR > targetAR) { sw = vh * targetAR; sx = (vw - sw) / 2; }
+            else if (videoAR < targetAR) { sh = vw / targetAR; sy = (vh - sh) / 2; }
+
+            // Flip orizzontale (live view e' specchiata)
+            try {
+              ctx.save();
+              ctx.translate(TARGET_W, 0);
+              ctx.scale(-1, 1);
+              ctx.drawImage(video, sx, sy, sw, sh, 0, 0, TARGET_W, TARGET_H);
+              ctx.restore();
+              console.log('[local-capture] video drawn ok');
+            } catch (eDraw) {
+              console.log('[local-capture] drawImage err: ' + eDraw.message);
+            }
+          } else {
+            console.log('[local-capture] WARN: video non pronto, sfondo nero');
+          }
+
+          var finish = function () {
+            try {
+              canvas.toBlob(function (blob) {
+                if (!blob) return;
+                var url = URL.createObjectURL(blob);
+                var stamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+                var fname = 'foto_' + stamp + '.jpg';
+                try { localStorage.setItem('last_picture_name', fname); } catch (_) {}
+                try { localStorage.setItem('last_picture_url', url); } catch (_) {}
+                showFotoTemp(url);
+                console.log('[local-capture] scatto OK url=' + url.slice(0, 32));
+              }, 'image/jpeg', 0.95);
+            } catch (e) { console.log('[local-capture] toBlob err: ' + e.message); }
+          };
+
+          // Importante: in locale salviamo SOLO la foto camera.
+          // La cornice viene applicata dal layer preview/save di main.js; se la
+          // disegniamo anche qui la vediamo doppia (logo duplicato in anteprima).
+          finish();
+        } catch (e) { console.log('[local-capture] err: ' + e.message); }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -115,19 +115,7 @@ function isLikelyOpaqueFolderName(value) {
 function normalizePhotoRootPath(folderPath) {
   const base = String(folderPath || '').trim();
   if (!base) return getDefaultPhotoRootPath();
-  const normalized = path.normalize(base);
-
-  const parsed = path.parse(normalized);
-  const rel = String(normalized.slice(parsed.root.length) || '');
-  const segments = rel.split(path.sep).filter(Boolean);
-  const fotoIdx = segments.findIndex((seg) => String(seg || '').toLowerCase() === DEFAULT_PHOTO_DIR_NAME.toLowerCase());
-  if (fotoIdx >= 0) {
-    return path.join(parsed.root, ...segments.slice(0, fotoIdx + 1));
-  }
-
-  const lastName = path.basename(normalized);
-  if (String(lastName || '').toLowerCase() === DEFAULT_PHOTO_DIR_NAME.toLowerCase()) return normalized;
-  return path.join(normalized, DEFAULT_PHOTO_DIR_NAME);
+  return path.normalize(base);
 }
 
 function resolveEventFolderName(rawFolder) {
@@ -140,6 +128,15 @@ function resolveEventFolderName(rawFolder) {
   }
 
   return current || 'evento_senza_nome';
+}
+
+function extractPhotoSeqId(fileName) {
+  const name = String(fileName || '').trim();
+  if (!name) return null;
+  const m = name.match(/_(\d{1,8})\.(?:jpg|jpeg|png|webp)$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function buildPhotoPathCandidates(rawFolder, rawFileName) {
@@ -167,6 +164,43 @@ function buildPhotoPathCandidates(rawFolder, rawFileName) {
     preferredFolder,
     candidates,
   };
+}
+
+function resolvePhotoPathByEventAndId(rawFolder, rawId) {
+  const idDigits = String(rawId || '').replace(/\D+/g, '');
+  const seq = parseInt(idDigits, 10);
+  if (!Number.isFinite(seq) || seq <= 0) return null;
+
+  const folders = [];
+  const pushFolder = (name) => {
+    const v = String(name || '').trim();
+    if (!v) return;
+    if (folders.indexOf(v) < 0) folders.push(v);
+  };
+
+  const safeRaw = getSafeEventFolderName(rawFolder || '');
+  if (safeRaw && safeRaw !== 'evento_senza_nome') pushFolder(safeRaw);
+  pushFolder(getCurrentEventFolderName());
+  pushFolder(resolveEventFolderName(rawFolder));
+
+  const root = getPhotoRootPath();
+  for (let fi = 0; fi < folders.length; fi++) {
+    const folderPath = path.join(root, folders[fi]);
+    let names = [];
+    try {
+      names = fsSync.readdirSync(folderPath);
+    } catch (_) {
+      names = [];
+    }
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      if (!/\.(jpg|jpeg|png|webp)$/i.test(name)) continue;
+      if (extractPhotoSeqId(name) === seq) {
+        return path.join(folderPath, name);
+      }
+    }
+  }
+  return null;
 }
 
 function setCurrentEventFolderName(rawName) {
@@ -295,6 +329,14 @@ function resolveImagePath(filename) {
   if (sep) {
     const folder = filename.split(sep)[0];
     const imageName = filename.split(sep).slice(1).join(sep);
+    const idMatch = String(imageName || '').trim().match(/^id\s*[:#-]?\s*(\d{1,8})$/i);
+    if (idMatch) {
+      const byIdPath = resolvePhotoPathByEventAndId(folder, idMatch[1]);
+      if (byIdPath) {
+        try { console.log('[print] gallery-id resolve', { folder, id: idMatch[1], path: byIdPath }); } catch (_) {}
+        return byIdPath;
+      }
+    }
     const mapped = buildPhotoPathCandidates(folder, imageName);
     for (let i = 0; i < mapped.candidates.length; i++) {
       const candidate = mapped.candidates[i];
@@ -315,6 +357,392 @@ function resolveImagePath(filename) {
   }
   return mapped.candidates[0];
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Printer state module
+// Una sola stampa alla volta. La coda di Windows e' usata SOLO come
+// fonte di stato reale (Get-PrintJob/Get-Printer). Nessuna accodazione.
+// ────────────────────────────────────────────────────────────────────────
+const { execFile } = require('child_process');
+const MS_PRINTER_CONFIG_PATH = path.join(__dirname, 'ms-printer-config.json');
+let selectedPrinterName = '';
+let activePrintJob = null; // { brokerJobId, fileName, startedAt }
+let lastPrinterState = null;
+let lastPrinterStateTs = 0;
+let lastPrinterDiagSig = '';
+let printerStatePollTimer = null;
+const PRINTER_STATE_CACHE_MS = 1500;
+const ACTIVE_PRINT_JOB_GRACE_MS = 8000;
+
+let printCalibration = { offsetXmm: 0, offsetYmm: 0, zoomPct: 100 };
+
+function msClampCalibration(c) {
+  const ox = Math.max(-20, Math.min(20, Number(c && c.offsetXmm) || 0));
+  const oy = Math.max(-20, Math.min(20, Number(c && c.offsetYmm) || 0));
+  const z  = Math.max(80,  Math.min(120, Number(c && c.zoomPct)   || 100));
+  return { offsetXmm: Math.round(ox * 10) / 10, offsetYmm: Math.round(oy * 10) / 10, zoomPct: Math.round(z * 10) / 10 };
+}
+
+function msLoadPersistedPrinter() {
+  try {
+    const raw = fsSync.readFileSync(MS_PRINTER_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.name === 'string') {
+      selectedPrinterName = parsed.name.trim();
+    }
+    if (parsed && parsed.calibration && typeof parsed.calibration === 'object') {
+      printCalibration = msClampCalibration(parsed.calibration);
+    }
+  } catch (_) {}
+}
+function msSavePersistedPrinter() {
+  try {
+    fsSync.writeFileSync(MS_PRINTER_CONFIG_PATH, JSON.stringify({ name: selectedPrinterName, calibration: printCalibration }), 'utf8');
+  } catch (_) {}
+}
+msLoadPersistedPrinter();
+
+function msEscapePsName(name) {
+  return String(name || '').replace(/'/g, "''");
+}
+
+function msIsBrokerUnavailableError(err) {
+  const msg = String((err && err.message) || '').toLowerCase();
+  return (
+    msg.includes('broker.token') ||
+    msg.includes('token broker non trovato') ||
+    msg.includes('print broker non disponibile') ||
+    msg.includes('econnrefused') ||
+    msg.includes('fetch failed') ||
+    msg.includes('networkerror')
+  );
+}
+
+function msSubmitDirectWindowsPrint(imagePath, printerName, opts) {
+  return new Promise((resolve, reject) => {
+    try {
+      const scriptPath = path.join(__dirname, 'ms-direct-print.ps1');
+      const cal = msClampCalibration(opts && opts.calibration ? opts.calibration : printCalibration);
+      const isTest = !!(opts && opts.testPattern);
+      const args = [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', scriptPath,
+        '-PrinterName', printerName,
+        '-OffsetXmm', String(cal.offsetXmm),
+        '-OffsetYmm', String(cal.offsetYmm),
+        '-ZoomPct',  String(cal.zoomPct),
+      ];
+      if (isTest) {
+        args.push('-TestPattern');
+      } else {
+        args.push('-ImagePath', imagePath);
+      }
+      execFile(
+        'powershell.exe',
+        args,
+        { windowsHide: true, timeout: 60000 },
+        (err, stdout, stderr) => {
+          try {
+            if (stdout) console.log('[ms-direct-print stdout]', String(stdout).trim());
+            if (stderr) console.warn('[ms-direct-print stderr]', String(stderr).trim());
+          } catch (_) {}
+          if (err) {
+            reject(new Error('DirectPrintFailed: ' + (err.message || 'powershell ms-direct-print failed')));
+            return;
+          }
+          resolve({
+            id: 'direct-' + Date.now(),
+            mode: 'direct',
+          });
+        }
+      );
+    } catch (e) {
+      reject(new Error('DirectPrintException: ' + (e && e.message ? e.message : String(e))));
+    }
+  });
+}
+
+function msReadWindowsPrintQueue(printerName) {
+  return new Promise((resolve) => {
+    if (!printerName) {
+      resolve({ ok: false, jobs: [], printerStatus: '', message: 'Stampante non selezionata' });
+      return;
+    }
+    const escaped = msEscapePsName(printerName);
+    const script =
+      "$ErrorActionPreference='SilentlyContinue';" +
+      "$p=Get-Printer -Name '" + escaped + "' 2>$null | Select-Object -First 1 Name,PrinterStatus,JobCount,WorkOffline,PrinterState,ExtendedPrinterStatus;" +
+      "$j=@(Get-PrintJob -PrinterName '" + escaped + "' 2>$null | Select-Object Id,JobStatus,DocumentName,Position,TotalPages,PagesPrinted,Size);" +
+      "$wmiFilter = \"Name='\" + ('" + escaped + "' -replace \"'\",\"''\") + \"'\";" +
+      "$w=Get-CimInstance -ClassName Win32_Printer -Filter $wmiFilter 2>$null | Select-Object -First 1 PrinterStatus,PrinterState,DetectedErrorState,WorkOffline,Status,Availability;" +
+      "$kw='SELPHY';" +
+      "if ($p -and $p.Name) { $tok = ($p.Name -split ' ' | Where-Object { $_.Length -ge 4 } | Select-Object -First 1); if ($tok) { $kw=$tok } };" +
+      "$pnp=@(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like ('*'+$kw+'*') } | Select-Object FriendlyName,Status,Class);" +
+      "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" +
+      "(@{ printer=$p; jobs=$j; wmi=$w; pnp=$pnp; kw=$kw } | ConvertTo-Json -Depth 5 -Compress)";
+    try {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 4500, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+        if (err) {
+          resolve({ ok: false, jobs: [], printerStatus: '', message: err.message || 'PowerShell error' });
+          return;
+        }
+        try {
+          const txt = String(stdout || '').trim();
+          if (!txt) {
+            resolve({ ok: true, jobs: [], printerStatus: '', message: '' });
+            return;
+          }
+          const parsed = JSON.parse(txt);
+          const rawJobs = (parsed && parsed.jobs) ? parsed.jobs : null;
+          const jobsArr = Array.isArray(rawJobs) ? rawJobs : (rawJobs ? [rawJobs] : []);
+          const printer = parsed && parsed.printer ? parsed.printer : null;
+          const wmi = parsed && parsed.wmi ? parsed.wmi : null;
+          const pnpRaw = parsed && parsed.pnp ? parsed.pnp : null;
+          const pnpArr = Array.isArray(pnpRaw) ? pnpRaw : (pnpRaw ? [pnpRaw] : []);
+          const pnpPresent = pnpArr.length > 0;
+          const pnpOk = pnpArr.some((d) => String(d && d.Status || '').toUpperCase() === 'OK');
+          const kw = String((parsed && parsed.kw) || '').trim();
+          resolve({
+            ok: true,
+            printerFound: !!printer,
+            wmiFound: !!wmi,
+            wmiPrinterStatus: Number((wmi && wmi.PrinterStatus) || 0),
+            wmiPrinterState: Number((wmi && wmi.PrinterState) || 0),
+            wmiDetectedErrorState: Number((wmi && wmi.DetectedErrorState) || 0),
+            wmiWorkOffline: !!(wmi && wmi.WorkOffline),
+            wmiAvailability: Number((wmi && wmi.Availability) || 0),
+            pnpPresent: !!pnpPresent,
+            pnpOk: !!pnpOk,
+            pnpDevices: pnpArr.map((d) => ({ name: String((d && d.FriendlyName) || ''), status: String((d && d.Status) || '') })),
+            pnpKeyword: kw,
+            jobs: jobsArr.map((j) => ({
+              id: (j && (j.Id != null ? j.Id : 0)) || 0,
+              status: String((j && j.JobStatus) || ''),
+              name: String((j && j.DocumentName) || ''),
+              position: Number((j && j.Position) || 0),
+              totalPages: Number((j && j.TotalPages) || 0),
+              pagesPrinted: Number((j && j.PagesPrinted) || 0),
+              size: Number((j && j.Size) || 0),
+            })),
+            printerStatus: String((printer && printer.PrinterStatus) || ''),
+            jobCount: Number((printer && printer.JobCount) || 0),
+            workOffline: !!(printer && printer.WorkOffline),
+            printerState: String((printer && printer.PrinterState) || ''),
+            extendedPrinterStatus: String((printer && printer.ExtendedPrinterStatus) || ''),
+            message: '',
+          });
+        } catch (e) {
+          resolve({ ok: false, jobs: [], printerStatus: '', message: 'ParseError: ' + e.message });
+        }
+      });
+    } catch (e) {
+      resolve({ ok: false, jobs: [], printerStatus: '', message: e.message });
+    }
+  });
+}
+
+function msClassifyPrinterStatus(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (!s) return { kind: 'unknown', label: '' };
+
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (n === 7) return { kind: 'offline', label: 'Stampante offline' };
+    if (n === 4 || n === 5) return { kind: 'busy', label: 'Stampa in corso' };
+    if (n === 3) return { kind: 'ready', label: 'Pronta' };
+    if (n === 6) return { kind: 'error', label: 'Stampante in pausa' };
+  }
+
+  if (s.includes('offline')) return { kind: 'offline', label: 'Stampante offline' };
+  if (s.includes('papererror') || s.includes('paperout') || s.includes('paper out') || s.includes('paperjam') || s.includes('paper jam') || s.includes('jam')) {
+    return { kind: 'error', label: 'Carta esaurita / inceppamento' };
+  }
+  if (s.includes('dooropen') || s.includes('door open') || s.includes('coveropen')) {
+    return { kind: 'error', label: 'Coperchio aperto' };
+  }
+  if (s.includes('error')) return { kind: 'error', label: 'Errore stampante' };
+  if (s.includes('paused')) return { kind: 'error', label: 'Stampante in pausa' };
+  if (s.includes('printing') || s.includes('busy') || s.includes('ioactive') || s.includes('processing') || s.includes('warmingup') || s.includes('warming up')) {
+    return { kind: 'busy', label: 'Stampa in corso' };
+  }
+  if (s.includes('normal') || s.includes('idle') || s.includes('ready')) return { kind: 'ready', label: 'Pronta' };
+  return { kind: 'unknown', label: raw };
+}
+
+async function msComputePrinterState(force) {
+  const now = Date.now();
+  if (!force && lastPrinterState && (now - lastPrinterStateTs) < PRINTER_STATE_CACHE_MS) {
+    return lastPrinterState;
+  }
+  const printerName = selectedPrinterName || '';
+  if (!printerName) {
+    const st = { printerName: '', status: 'no-printer', label: 'Seleziona una stampante', jobs: [], jobCount: 0, hasActiveJob: false, activeJobId: null, rawPrinterStatus: '', message: '', progress: 0 };
+    lastPrinterState = st; lastPrinterStateTs = now;
+    return st;
+  }
+  const q = await msReadWindowsPrintQueue(printerName);
+  const hasQueueJobs = !!(q.jobs && q.jobs.length > 0);
+  if (!hasQueueJobs && activePrintJob) {
+    const startedAt = Number(activePrintJob.startedAt) || now;
+    if ((now - startedAt) >= ACTIVE_PRINT_JOB_GRACE_MS) {
+      activePrintJob = null;
+    }
+  }
+  let status = 'ready';
+  let label = 'Pronta';
+  if (!q.ok) {
+    status = 'offline';
+    label = q.message || 'Stampante non raggiungibile';
+  } else {
+    const rawStatus = String(q.printerStatus || '').trim();
+    const rawState = String(q.printerState || '').trim();
+    const rawExtended = String(q.extendedPrinterStatus || '').trim();
+    const cls = msClassifyPrinterStatus([rawStatus, rawState, rawExtended].filter(Boolean).join(' '));
+    if (hasQueueJobs || activePrintJob) {
+      status = 'busy';
+      label = 'Stampa in corso';
+    } else if (!q.printerFound) {
+      status = 'offline';
+      label = 'Stampante non trovata';
+    } else if (q.workOffline || q.wmiWorkOffline) {
+      status = 'offline';
+      label = 'Stampante offline';
+    } else if (q.wmiFound && Number(q.wmiPrinterStatus) === 7) {
+      status = 'offline';
+      label = 'Stampante offline';
+    } else if (q.pnpKeyword && !q.pnpPresent) {
+      status = 'offline';
+      label = 'Stampante spenta o scollegata';
+    } else if (q.pnpKeyword && q.pnpPresent && !q.pnpOk) {
+      status = 'error';
+      label = 'Errore dispositivo USB';
+    } else if (q.wmiFound && Number(q.wmiPrinterStatus) === 6) {
+      status = 'error';
+      label = 'Stampante in pausa';
+    } else if (q.wmiFound && (Number(q.wmiPrinterStatus) === 4 || Number(q.wmiPrinterStatus) === 5)) {
+      status = 'busy';
+      label = 'Stampa in corso';
+    } else if (!rawStatus && !rawState && !rawExtended) {
+      status = 'ready';
+      label = 'Pronta';
+    } else if (!rawStatus) {
+      status = 'offline';
+      label = 'Stampante spenta o scollegata';
+    } else if (cls.kind === 'offline') {
+      status = 'offline';
+      label = cls.label;
+    } else if (cls.kind === 'error') {
+      status = 'error';
+      label = cls.label;
+    } else if (cls.kind === 'unknown') {
+      status = 'offline';
+      label = 'Stato stampante non rilevato';
+    } else {
+      status = 'ready';
+      label = 'Pronta';
+    }
+  }
+  let progress = 0;
+  if (hasQueueJobs) {
+    const j = q.jobs[0];
+    if (j.totalPages > 0) progress = Math.min(100, Math.round((j.pagesPrinted / j.totalPages) * 100));
+    else if (activePrintJob) progress = Math.min(95, Math.round((Date.now() - activePrintJob.startedAt) / 600));
+  } else if (activePrintJob && status === 'busy') {
+    progress = Math.min(95, Math.round((Date.now() - activePrintJob.startedAt) / 600));
+  }
+  const state = {
+    printerName,
+    status,
+    label,
+    jobs: q.jobs || [],
+    jobCount: (q.jobs || []).length,
+    hasActiveJob: !!activePrintJob,
+    activeJobId: activePrintJob ? activePrintJob.brokerJobId : null,
+    rawPrinterStatus: q.printerStatus || '',
+    message: q.message || '',
+    progress,
+  };
+  try {
+    const diagSig = [
+      state.printerName || '',
+      String(q.ok ? 'ok' : 'err'),
+      q.printerFound ? '1' : '0',
+      String(state.rawPrinterStatus || '').trim(),
+      q.workOffline ? '1' : '0',
+      String(q.printerState || '').trim(),
+      String(q.extendedPrinterStatus || '').trim(),
+      q.wmiFound ? '1' : '0',
+      String(Number(q.wmiPrinterStatus || 0)),
+      String(Number(q.wmiPrinterState || 0)),
+      String(Number(q.wmiDetectedErrorState || 0)),
+      q.wmiWorkOffline ? '1' : '0',
+      String(q.pnpKeyword || ''),
+      q.pnpPresent ? '1' : '0',
+      q.pnpOk ? '1' : '0',
+      String(state.status || ''),
+      String(state.jobCount || 0),
+      state.hasActiveJob ? '1' : '0',
+      String(state.message || ''),
+    ].join('|');
+    if (diagSig !== lastPrinterDiagSig) {
+      lastPrinterDiagSig = diagSig;
+      console.log('[printer-state raw] name=%s ok=%s found=%s raw="%s" workOffline=%s pState="%s" ext="%s" wmi{found=%s,status=%d,state=%d,err=%d,off=%s,avail=%d} pnp{kw=%s,present=%s,ok=%s,n=%d} status=%s jobs=%d active=%s msg="%s"',
+        state.printerName || '-',
+        q.ok ? 'true' : 'false',
+        q.printerFound ? '1' : '0',
+        String(state.rawPrinterStatus || ''),
+        q.workOffline ? '1' : '0',
+        String(q.printerState || ''),
+        String(q.extendedPrinterStatus || ''),
+        q.wmiFound ? '1' : '0',
+        Number(q.wmiPrinterStatus || 0),
+        Number(q.wmiPrinterState || 0),
+        Number(q.wmiDetectedErrorState || 0),
+        q.wmiWorkOffline ? '1' : '0',
+        Number(q.wmiAvailability || 0),
+        String(q.pnpKeyword || ''),
+        q.pnpPresent ? '1' : '0',
+        q.pnpOk ? '1' : '0',
+        Array.isArray(q.pnpDevices) ? q.pnpDevices.length : 0,
+        state.status,
+        Number(state.jobCount || 0),
+        state.hasActiveJob ? '1' : '0',
+        String(state.message || ''));
+    }
+  } catch (_) {}
+  lastPrinterState = state;
+  lastPrinterStateTs = now;
+  return state;
+}
+
+function msBroadcastPrinterState(state) {
+  try {
+    BrowserWindow.getAllWindows().forEach((w) => {
+      try {
+        if (w && !w.isDestroyed() && w.webContents && !w.webContents.isDestroyed()) {
+          w.webContents.send('printer-state', state);
+        }
+      } catch (_) {}
+    });
+  } catch (_) {}
+}
+
+function msStartPrinterPolling() {
+  if (printerStatePollTimer) return;
+  printerStatePollTimer = setInterval(async () => {
+    try {
+      const st = await msComputePrinterState(true);
+      msBroadcastPrinterState(st);
+      if (activePrintJob && (st.jobs || []).length === 0) {
+        activePrintJob = null;
+        msBroadcastPrinterState(await msComputePrinterState(true));
+      }
+    } catch (_) {}
+  }, 2000);
+}
+try { msStartPrinterPolling(); } catch (_) {}
 
 // Iniezione DEDICATA, idempotente e SENZA guardia di flag: garantisce che
 // il bottone "Torna al pannello" e lo shield invisibile bottom-left siano
@@ -1160,6 +1588,28 @@ function injectSessionFrameOverlay(win, targetFrame) {
               '.ms-lv-arrow svg{width:32px;height:32px;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.55));}' +
               '.ms-lv-arrow-label{display:none;}' +
 
+              // ── Live printer pill ──
+              '#ms-lv-printer-pill{position:fixed;top:32px;right:32px;z-index:2147483647;pointer-events:none;' +
+              'display:inline-flex;align-items:center;gap:10px;padding:10px 18px;border-radius:999px;' +
+              'background:linear-gradient(180deg,rgba(22,22,28,0.62) 0%,rgba(14,14,18,0.66) 100%);' +
+              'backdrop-filter:blur(38px) saturate(160%) brightness(1.04);-webkit-backdrop-filter:blur(38px) saturate(160%) brightness(1.04);' +
+              'border:1px solid rgba(255,255,255,0.13);' +
+              'box-shadow:0 12px 30px rgba(0,0,0,0.50),inset 0 1px 0 rgba(255,255,255,0.07);' +
+              'color:rgba(255,255,255,0.92);' +
+              'font-family:"SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
+              'font-size:14px;font-weight:500;letter-spacing:0.6px;line-height:1;white-space:nowrap;}' +
+              '#ms-lv-printer-pill .ms-lv-pp-dot{width:10px;height:10px;border-radius:50%;background:#9ca3af;box-shadow:0 0 6px rgba(255,255,255,0.18);}' +
+              '#ms-lv-printer-pill[data-status="ready"] .ms-lv-pp-dot{background:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.6);}' +
+              '#ms-lv-printer-pill[data-status="busy"] .ms-lv-pp-dot{background:#facc15;box-shadow:0 0 10px rgba(250,204,21,0.6);animation:msLvPpPulse 1.4s ease-in-out infinite;}' +
+              '#ms-lv-printer-pill[data-status="error"] .ms-lv-pp-dot,#ms-lv-printer-pill[data-status="offline"] .ms-lv-pp-dot{background:#ef4444;box-shadow:0 0 10px rgba(239,68,68,0.6);}' +
+              '#ms-lv-printer-pill .ms-lv-pp-bar{position:absolute;left:8px;right:8px;bottom:4px;height:2px;border-radius:2px;background:rgba(255,255,255,0.08);overflow:hidden;}' +
+              '#ms-lv-printer-pill .ms-lv-pp-fill{height:100%;width:0;background:linear-gradient(90deg,#facc15,#f97316);transition:width 0.4s ease;}' +
+              '@keyframes msLvPpPulse{0%,100%{opacity:1;}50%{opacity:0.55;}}' +
+
+              // ── Pulsante scatto disabilitato durante stampa ──
+              '.ms-lv-shoot.is-print-busy{filter:grayscale(0.5) brightness(0.8);opacity:0.65;pointer-events:none!important;cursor:not-allowed!important;animation:none!important;}' +
+              '.ms-lv-shoot.is-print-busy::before,.ms-lv-shoot.is-print-busy::after{animation:none!important;}' +
+
               // ── Wrap pulsante scatto ──
               '.ms-lv-shoot-wrap{display:flex;flex-direction:column;align-items:center;gap:10px;margin:0 8px;}' +
               '.ms-lv-label{display:none;}' +
@@ -1276,6 +1726,27 @@ function injectSessionFrameOverlay(win, targetFrame) {
                 '<div class="ms-lv-arrow-label">Successiva</div>' +
               '</div>';
             (document.body || document.documentElement).appendChild(bar);
+            // Pillola stato stampante in alto a destra (sempre visibile in pre-scatto)
+            try {
+              var __pp = document.getElementById('ms-lv-printer-pill');
+              if (!__pp) {
+                __pp = document.createElement('div');
+                __pp.id = 'ms-lv-printer-pill';
+                __pp.setAttribute('data-status', 'no-printer');
+                __pp.innerHTML = '<span class="ms-lv-pp-dot"></span><span class="ms-lv-pp-label">Stampante</span>';
+                (document.body || document.documentElement).appendChild(__pp);
+              }
+              if (window.electronAPI && typeof window.electronAPI.getPrinterState === 'function') {
+                if (typeof window.__msSubscribePrinterState === 'function') { try { window.__msSubscribePrinterState(); } catch (_) {} }
+                if (typeof window.__msFetchPrinterState === 'function') { try { window.__msFetchPrinterState(true); } catch (_) {} }
+                // Polling locale aggiuntivo per aggiornare la pillola in pre-scatto
+                if (!window.__msLvPrinterPoll) {
+                  window.__msLvPrinterPoll = setInterval(function() {
+                    try { if (typeof window.__msFetchPrinterState === 'function') window.__msFetchPrinterState(false); } catch (_) {}
+                  }, 2500);
+                }
+              }
+            } catch (_) {}
             // Sfoglio cornici locali
             var cycleLocal = function(dir) {
               try {
@@ -1361,10 +1832,113 @@ function injectSessionFrameOverlay(win, targetFrame) {
           var els = document.getElementsByName(name);
           var el = els && els[0];
           if (!el) return false;
+          var hasSrc = !!(el.src || el.currentSrc);
+          if (!hasSrc) return false;
           try { el.currentTime = 0; } catch (_) {}
           try { el.muted = false; el.volume = 1.0; } catch (_) {}
           var p = el.play();
-          if (p && typeof p.catch === 'function') p.catch(function() {});
+          if (p && typeof p.catch === 'function') {
+            p.catch(function() {
+              // Autoplay bloccato o decode fallito: fallback al beep WebAudio.
+              try {
+                if (name === 'sound_shot') {
+                  window.__msBeep && window.__msBeep(1200, 0.32, 0.45, 'triangle');
+                } else if (/^sound_[1-9]$/.test(name)) {
+                  window.__msBeep && window.__msBeep(700, 0.12, 0.32, 'sine');
+                } else {
+                  window.__msBeep && window.__msBeep(1320, 0.10, 0.32, 'sine');
+                }
+              } catch (_) {}
+            });
+          }
+          return true;
+        } catch (_) { return false; }
+      };
+      window.__msPlaySaveSound = function() {
+        try {
+          var played = false;
+          var names = ['sound_ok', 'sound_confirm', 'sound_save', 'sound_click'];
+          for (var i = 0; i < names.length; i++) {
+            if (window.__msPlayPageSound(names[i])) { played = true; break; }
+          }
+          // Fallback: prova a usare direttamente gli audio reali della pagina
+          // (evita countdown/scatto) cercando file "ok/save/confirm/click".
+          if (!played) {
+            try {
+              var audios = Array.from(document.querySelectorAll('audio'));
+              var pick = null;
+              for (var ai = 0; ai < audios.length; ai++) {
+                var a = audios[ai];
+                var name = String(a.getAttribute('name') || '').toLowerCase();
+                if (name === 'sound_shot' || /^sound_[1-5]$/.test(name)) continue;
+                var src = String(a.currentSrc || a.src || '').toLowerCase();
+                if (/save|salv|ok|confirm|click/.test(src) || /ok|confirm|save|click/.test(name)) {
+                  pick = a;
+                  break;
+                }
+              }
+              if (!pick) {
+                for (var aj = 0; aj < audios.length; aj++) {
+                  var b = audios[aj];
+                  var bName = String(b.getAttribute('name') || '').toLowerCase();
+                  if (bName && bName !== 'sound_shot' && !/^sound_[1-5]$/.test(bName)) {
+                    pick = b;
+                    break;
+                  }
+                }
+              }
+              if (pick) {
+                try { pick.currentTime = 0; } catch (_) {}
+                try { pick.muted = false; pick.volume = 1.0; } catch (_) {}
+                var pp = pick.play();
+                if (pp && typeof pp.catch === 'function') pp.catch(function() {});
+                played = true;
+              }
+            } catch (_) {}
+          }
+          if (!played) {
+            try { window.__msBeep(950, 0.09, 0.28, 'triangle'); } catch (_) {}
+          }
+          return true;
+        } catch (_) { return false; }
+      };
+      window.__msPlayUiButtonSound = function(kind) {
+        try {
+          var k = String(kind || 'generic').toLowerCase();
+          var played = false;
+          var __playPrinterSynth = function() {
+            try {
+              // Timbrica "stampante": 3 colpi rapidi + coda breve.
+              window.__msBeep && window.__msBeep(560, 0.055, 0.22, 'square');
+              setTimeout(function() { try { window.__msBeep && window.__msBeep(510, 0.06, 0.22, 'square'); } catch (_) {} }, 70);
+              setTimeout(function() { try { window.__msBeep && window.__msBeep(470, 0.07, 0.20, 'square'); } catch (_) {} }, 145);
+              setTimeout(function() { try { window.__msBeep && window.__msBeep(360, 0.10, 0.14, 'triangle'); } catch (_) {} }, 245);
+            } catch (_) {}
+          };
+          var names = (k === 'save')
+            ? ['sound_save', 'sound_ok', 'sound_confirm']
+            : (k === 'print')
+              ? ['sound_print', 'sound_printer', 'sound_confirm', 'sound_click']
+            : (k === 'cancel')
+              ? ['sound_cancel', 'sound_click', 'sound_back']
+              : ['sound_click', 'sound_confirm', 'sound_ok'];
+          for (var i = 0; i < names.length; i++) {
+            if (window.__msPlayPageSound(names[i])) { played = true; break; }
+          }
+          if (!played) {
+            try {
+              if (k === 'save') window.__msBeep(1460, 0.09, 0.24, 'triangle');
+              else if (k === 'print') {
+                __playPrinterSynth();
+              }
+              else if (k === 'cancel') window.__msBeep(760, 0.08, 0.2, 'sawtooth');
+              else window.__msBeep(980, 0.08, 0.22, 'sine');
+            } catch (_) {}
+          } else if (k === 'print') {
+            // Anche se abbiamo suonato un file audio pagina, aggiungi un leggero
+            // accento synth per rendere il feedback "stampante" sempre percepibile.
+            setTimeout(function() { try { window.__msBeep && window.__msBeep(430, 0.045, 0.12, 'square'); } catch (_) {} }, 35);
+          }
           return true;
         } catch (_) { return false; }
       };
@@ -1976,7 +2550,20 @@ function injectSessionFrameOverlay(win, targetFrame) {
                   } catch (_) {}
 
                   var imgs = ft.getElementsByTagName('img');
-                  var img = imgs && imgs.length ? imgs[0] : null;
+                  var img = null;
+                  try {
+                    if (imgs && imgs.length) {
+                      for (var __ii = 0; __ii < imgs.length; __ii++) {
+                        var __cand = imgs[__ii];
+                        if (!__cand) continue;
+                        // Escludi layer tecnici/overlay: non sono la foto scattata.
+                        if (__cand.id === 'ms-preview-frame-ov' || __cand.id === 'ms-preview-bg') continue;
+                        var __src = String(__cand.currentSrc || __cand.src || '').trim();
+                        if (__src) { img = __cand; break; }
+                      }
+                      if (!img) img = imgs[0];
+                    }
+                  } catch (_) {}
                   if (!img) return false;
 
                   try {
@@ -1987,15 +2574,15 @@ function injectSessionFrameOverlay(win, targetFrame) {
                     var rawImgSrc = String(img.currentSrc || img.src || '').trim();
                     var isUsablePreviewSrc = function(value) {
                       var lower = String(value || '').toLowerCase();
-                      return !!lower && lower.indexOf('blob:') !== 0 && lower.indexOf('cursor_cancel.png') === -1 && lower.indexOf('cursor_ok.png') === -1 && lower.indexOf('/mirror/index') === -1;
+                      return !!lower && lower.indexOf('cursor_cancel.png') === -1 && lower.indexOf('cursor_ok.png') === -1 && lower.indexOf('/mirror/index') === -1;
                     };
                     var previewSrc = isUsablePreviewSrc(forced)
                       ? forced
                       : (isUsablePreviewSrc(currentMainSrc)
                         ? currentMainSrc
-                        : (isUsablePreviewSrc(fallback)
-                          ? fallback
-                          : (isUsablePreviewSrc(rawImgSrc) ? rawImgSrc : fallback)));
+                        : (isUsablePreviewSrc(rawImgSrc)
+                          ? rawImgSrc
+                          : (isUsablePreviewSrc(fallback) ? fallback : rawImgSrc)));
 
                     // Background blurred cinematico: copre TUTTO il viewport,
                     // forte blur + dark overlay -> percezione "foto sospesa davanti"
@@ -2048,6 +2635,28 @@ function injectSessionFrameOverlay(win, targetFrame) {
                     }
                   } catch (_) {}
 
+                  // Filigrana ID SOLO visiva in preview (non viene salvata/stampata)
+                  try {
+                    var __idWm = ft.querySelector(':scope > div#ms-preview-id-watermark');
+                    if (!__idWm) {
+                      __idWm = document.createElement('div');
+                      __idWm.id = 'ms-preview-id-watermark';
+                      ft.appendChild(__idWm);
+                    }
+                    var __idTxt = String(window.__msCurrentPreviewIdText || '').trim() || 'ID ----';
+                    __idWm.textContent = __idTxt;
+                    __idWm.style.cssText =
+                      'position:absolute!important;' +
+                      'right:34px!important;' +
+                      'bottom:calc(var(--ms-dock-h) + var(--ms-dock-bottom) + 24px)!important;' +
+                      'z-index:2147483646!important;' +
+                      'pointer-events:none!important;' +
+                      'font-family:"SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif!important;' +
+                      'font-size:30px!important;font-weight:700!important;letter-spacing:0.08em!important;' +
+                      'color:rgba(255,255,255,0.90)!important;' +
+                      'text-shadow:0 3px 16px rgba(0,0,0,0.85),0 0 2px rgba(0,0,0,0.9)!important;';
+                  } catch (_) {}
+
                   // (Rimossi #ms-preview-bar e #ms-preview-vignette: la card
                   // flottante non occupa più il fullscreen quindi non servono
                   // gradient di leggibilità sopra la foto.)
@@ -2090,6 +2699,11 @@ function injectSessionFrameOverlay(win, targetFrame) {
 
                       var __panelPrint = document.getElementById('ms-t-print');
                       var __panelEnabled = __panelPrint ? !!__panelPrint.checked : true;
+                      try {
+                        var __prefRaw = localStorage.getItem('msPanelPrintEnabled');
+                        if (__prefRaw === '0') __panelEnabled = false;
+                        if (__prefRaw === '1') __panelEnabled = true;
+                      } catch (_) {}
                       var __cb = __msGetPrintCheckbox();
                       var __allowed = __panelEnabled;
                       if (__cb && __cb.disabled) __allowed = false;
@@ -2196,16 +2810,16 @@ function injectSessionFrameOverlay(win, targetFrame) {
                         //   shift-y = -(dock-block / 2) per spostare la card su rispetto al viewport
                         '#ms-preview-main{position:absolute!important;' +
                           'top:50%!important;left:50%!important;' +
-                          'width:calc(var(--ms-card-w) * var(--ms-photo-w))!important;' +
-                          'height:calc(var(--ms-card-h) * var(--ms-photo-h))!important;' +
-                          'margin-left:calc(var(--ms-card-w) * (var(--ms-photo-left) - 0.5))!important;' +
-                          'margin-top:calc(var(--ms-card-h) * (var(--ms-photo-top) - 0.5) - var(--ms-dock-block) / 2)!important;' +
+                          'width:calc(var(--ms-card-w) * var(--ms-photo-w) + 10px)!important;' +
+                          'height:calc(var(--ms-card-h) * var(--ms-photo-h) + 10px)!important;' +
+                          'margin-left:calc(var(--ms-card-w) * (var(--ms-photo-left) - 0.5) - 5px)!important;' +
+                          'margin-top:calc(var(--ms-card-h) * (var(--ms-photo-top) - 0.5) - var(--ms-dock-block) / 2 - 5px)!important;' +
                           'object-fit:cover!important;object-position:center center!important;' +
                           'background:transparent!important;image-rendering:auto!important;' +
                           'pointer-events:none!important;z-index:3!important;' +
                           'display:block!important;visibility:visible!important;' +
                           'border-radius:4px!important;padding:0!important;border:0!important;' +
-                          'animation:msPvCardInMirror 0.85s cubic-bezier(.22,1.12,.36,1) both!important;}' +
+                          'animation:msPvCardIn 0.85s cubic-bezier(.22,1.12,.36,1) both!important;}' +
 
                         // ── CORNICE GRAFICA (stessa centratura, dimensione card piena) ──
                         '#ms-preview-frame-ov{position:absolute!important;' +
@@ -2338,7 +2952,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
                       var __svgPr = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>';
                       __ab.innerHTML =
                         '<button id="ms-btn-cancel" class="ms-pb-btn ms-pb-cancel">' + __svgX + '<span class="ms-pb-lbl">Riprova</span></button>' +
-                        '<button id="ms-btn-stampa" class="ms-pb-btn ms-pb-stampa" data-checked="1"><span class="ms-pb-check"></span>' + __svgPr + '<span class="ms-pb-lbl">Stampa</span></button>' +
+                        '<button id="ms-btn-stampa" class="ms-pb-btn ms-pb-stampa" data-checked="1"><span class="ms-pb-check"></span>' + __svgPr + '<span class="ms-pb-lbl">Salva e stampa</span></button>' +
                         '<button id="ms-btn-ok" class="ms-pb-btn ms-pb-ok">' + __svgOk + '<span class="ms-pb-lbl">Salva</span></button>';
                       ft.appendChild(__ab);
                       __msSyncPreviewPrintButton();
@@ -2383,6 +2997,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
                       // Riprova → dispatch click su cursor_cancel
                       document.getElementById('ms-btn-cancel').addEventListener('click', function() {
                         try {
+                          try { if (typeof window.__msPlayUiButtonSound === 'function') window.__msPlayUiButtonSound('cancel'); } catch (_) {}
                           __msCleanupPreviewStyles();
                           var __ci = document.querySelector('img[src*="cursor_cancel"]');
                           if (__ci) __ci.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
@@ -2405,27 +3020,69 @@ function injectSessionFrameOverlay(win, targetFrame) {
                       document.getElementById('ms-btn-stampa').addEventListener('click', function() {
                         try {
                           if (this.disabled || this.getAttribute('data-disabled') === '1') return;
+                          try { if (typeof window.__msPlayUiButtonSound === 'function') window.__msPlayUiButtonSound('print'); } catch (_) {}
                           var __cb = __msGetPrintCheckbox();
-                          if (__cb && !__cb.disabled) __cb.click();
-                          __msSyncPreviewPrintButton();
+                          if (__cb && !__cb.disabled) __cb.checked = true;
+                          this.setAttribute('data-checked', '1');
+                          // Flag persistente: sopravvive a __msCleanupPreviewStyles() che rimuove la action-bar.
+                          window.__msPendingPrint = true;
+                          try { showToast('Salvataggio e stampa in corso…', 1800, '#3b82f6'); } catch (_) {}
+                          var __okBtn = document.getElementById('ms-btn-ok');
+                          if (__okBtn && typeof __okBtn.click === 'function') {
+                            __okBtn.click();
+                          }
                         } catch (_) {}
                       });
                       // Salva → dispatch click su cursor_ok
                       document.getElementById('ms-btn-ok').addEventListener('click', function() {
                         try {
+                          try { if (typeof window.__msPlayUiButtonSound === 'function') window.__msPlayUiButtonSound('save'); } catch (_) {}
                           __msCleanupPreviewStyles();
                           var __lp = '';
                           var __ln = '';
                           try {
-                            __lp = String(localStorage.getItem('last_picture_url') || '').trim();
+                            // 1) Blob interceptato durante lo scatto (ha già cornice applicata)
+                            var __intercepted = String(window.__msLastBlobDataUrl || '').trim();
+                            if (__intercepted && __intercepted.indexOf('data:image/') === 0) {
+                              __lp = __intercepted;
+                              console.log('[ms] photo from intercepted blob size=' + Math.round(__lp.length / 1024) + 'KB');
+                            }
+                            // 2) Canvas (solo se non c'è blob - canvas può mostrare feed live)
+                            if (!__lp || __lp.indexOf('data:image/') !== 0) {
+                              var __cv = window.__msLastPhotoCanvas;
+                              if (__cv && __cv.width > 100 && __cv.height > 100) {
+                                try {
+                                  __lp = __cv.toDataURL('image/jpeg', 0.95);
+                                  console.log('[ms] photo from canvas ' + __cv.width + 'x' + __cv.height + ' size=' + Math.round(__lp.length / 1024) + 'KB');
+                                } catch (cvErr) {
+                                  console.log('[ms] canvas.toDataURL err: ' + cvErr.message);
+                                  __lp = '';
+                                }
+                              }
+                            }
+                            // 3) Fallback: last_picture_url da localStorage
+                            if (!__lp || __lp.indexOf('data:image/') !== 0) {
+                              __lp = String(localStorage.getItem('last_picture_url') || '').trim();
+                              if (__lp) console.log('[ms] photo from localStorage url type=' + __lp.slice(0, 20));
+                            }
                             __ln = String(localStorage.getItem('last_picture_name') || '').trim();
                           } catch (_) {}
 
                           var __evtRaw = 'evento_senza_nome';
                           try {
-                            var __es = document.getElementById('ms-evt-sel');
-                            if (__es && __es.selectedIndex >= 0 && __es.options && __es.options[__es.selectedIndex]) {
-                              __evtRaw = String(__es.options[__es.selectedIndex].textContent || '').trim() || __evtRaw;
+                            // 1) Selezione salvata al click START (sorgente di verità)
+                            var __savedEvtTxt = String(localStorage.getItem(MS_LAST_EVT_KEY) || '').trim();
+                            if (__savedEvtTxt) {
+                              __evtRaw = __savedEvtTxt;
+                              console.log('[ms] evtRaw from localStorage: ' + __evtRaw);
+                            } else {
+                              // 2) Fallback: dropdown corrente
+                              var __es = document.getElementById('ms-evt-sel');
+                              if (__es && __es.selectedIndex >= 0 && __es.options && __es.options[__es.selectedIndex]) {
+                                var __esTxt = String(__es.options[__es.selectedIndex].textContent || '').trim();
+                                if (__esTxt) __evtRaw = __esTxt;
+                              }
+                              console.log('[ms] evtRaw from dropdown: ' + __evtRaw + ' (saved was empty)');
                             }
                           } catch (_) {}
 
@@ -2440,27 +3097,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
                             __ln = __evtSafe + '§' + (new Date().toISOString().slice(0, 19).replace(/:/g, '-')) + '.jpg';
                           }
 
-                          var __savedViaIpc = false;
-                          if (__lp && window.electronAPI && typeof window.electronAPI.saveCapturedPhoto === 'function') {
-                            try {
-                              window.electronAPI.saveCapturedPhoto({
-                                dataUrl: __lp,
-                                fileName: __ln,
-                                eventName: __evtRaw
-                              }).then(function(res) {
-                                try {
-                                  if (res && res.success) {
-                                    console.log('[ms] saveCapturedPhoto OK path=' + (res.path || ''));
-                                  } else {
-                                    console.log('[ms] saveCapturedPhoto FAIL', res && res.message ? res.message : 'unknown');
-                                  }
-                                } catch (_) {}
-                              }).catch(function() {});
-                              __savedViaIpc = true;
-                            } catch (_) {}
-                          }
-
-                          if (!__savedViaIpc) {
+                          var __runFallbackSave = function() {
                             var __nativeTriggered = false;
                             var __oi = document.querySelector('img[src*="cursor_ok"],img[src*="cursor%5Fok"],#cursor_ok');
                             if (__oi) {
@@ -2480,6 +3117,214 @@ function injectSessionFrameOverlay(win, targetFrame) {
                               __a.click();
                               if (__a.parentNode) __a.parentNode.removeChild(__a);
                             }
+                          };
+
+                          var __saveViaIpc = function(dataUrl) {
+                            return window.electronAPI.saveCapturedPhoto({
+                              dataUrl: dataUrl,
+                              fileName: __ln,
+                              eventName: __evtRaw
+                            }).then(function(res) {
+                              try {
+                                if (res && res.success) {
+                                  console.log('[ms] saveCapturedPhoto OK path=' + (res.path || ''));
+                                  try { if (typeof window.__msRefreshPreviewIdWatermark === 'function') window.__msRefreshPreviewIdWatermark(); } catch (_) {}
+                                  try {
+                                    if (typeof window.__msPlaySaveSound === 'function') {
+                                      window.__msPlaySaveSound();
+                                    }
+                                  } catch (_) {}
+                                  return res;
+                                }
+                                console.log('[ms] saveCapturedPhoto FAIL', res && res.message ? res.message : 'unknown');
+                              } catch (_) {}
+                              return null;
+                            }).catch(function() { return null; });
+                          };
+
+                          var __printSavedOriginal = function(savedRes) {
+                            return new Promise(function(resolve) {
+                              try {
+                                if (!savedRes || !savedRes.path || !window.electronAPI || typeof window.electronAPI.printImage !== 'function') {
+                                  resolve(false); return;
+                                }
+                                // L'intento di stampa e' ESPLICITO: solo il click su
+                                // "Salva e stampa" imposta window.__msPendingPrint=true.
+                                // Il bottone "Salva" puro NON deve mai stampare.
+                                var __wantsPrint = !!window.__msPendingPrint;
+                                if (!__wantsPrint) { resolve(false); return; }
+                                try { window.__msPendingPrint = false; } catch (_) {}
+                                try { console.log('[ms] preview-print -> path=' + String(savedRes.path)); } catch (_) {}
+                                try { showToast('Invio stampa…', 1600, '#3b82f6'); } catch (_) {}
+
+                                try {
+                                  var __cur = (window.__msPrinterState && typeof window.__msPrinterState === 'object') ? window.__msPrinterState : {};
+                                  window.__msPrinterState = Object.assign({}, __cur, {
+                                    status: 'busy',
+                                    label: 'Invio in stampa…',
+                                    hasActiveJob: true,
+                                    progress: 5,
+                                  });
+                                  if (typeof window.__msUpdatePrinterState === 'function') window.__msUpdatePrinterState(window.__msPrinterState);
+                                } catch (_) {}
+
+                                var __printerName = (window.__msPrinterState && window.__msPrinterState.printerName) ? window.__msPrinterState.printerName : null;
+                                try { console.log('[ms] printImage call printer=' + String(__printerName || '(default)')); } catch (_) {}
+                                window.electronAPI.printImage(String(savedRes.path), __printerName, { copies: 1, paperSize: 'Paper10x15', orientation: 'Portrait' })
+                                  .then(function(res) {
+                                    try { console.log('[ms] printImage res=' + JSON.stringify(res || null)); } catch (_) {}
+                                    if (res && res.success) {
+                                      try { showToast('Stampa avviata', 1800, '#22c55e'); } catch (_) {}
+                                      try { if (typeof window.__msFetchPrinterState === 'function') window.__msFetchPrinterState(true); } catch (_) {}
+                                      resolve(true);
+                                      return;
+                                    }
+                                    if (res && res.busy) {
+                                      try { showToast('Stampante occupata: attendi…', 2200, '#facc15'); } catch (_) {}
+                                      try { if (typeof window.__msFetchPrinterState === 'function') window.__msFetchPrinterState(true); } catch (_) {}
+                                      resolve(false);
+                                      return;
+                                    }
+                                    try { showToast('Stampa fallita: ' + ((res && res.message) || 'errore sconosciuto'), 2600, '#ef4444'); } catch (_) {}
+                                    try { if (typeof window.__msFetchPrinterState === 'function') window.__msFetchPrinterState(true); } catch (_) {}
+                                    resolve(false);
+                                  })
+                                  .catch(function(err) {
+                                    try { console.log('[ms] printImage error=' + String(err && err.message ? err.message : err)); } catch (_) {}
+                                    try { showToast('Errore stampa: ' + (err && err.message ? err.message : 'sconosciuto'), 2600, '#ef4444'); } catch (_) {}
+                                    try { if (typeof window.__msFetchPrinterState === 'function') window.__msFetchPrinterState(true); } catch (_) {}
+                                    resolve(false);
+                                  });
+                              } catch (_) { resolve(false); }
+                            });
+                          };
+
+                          var __toDataUrlPromise = function(urlLike) {
+                            return new Promise(function(resolve, reject) {
+                              try {
+                                var src = String(urlLike || '').trim();
+                                if (!src) { reject(new Error('missing source')); return; }
+                                if (src.indexOf('data:image/') === 0) { resolve(src); return; }
+
+                                fetch(src).then(function(resp) {
+                                  if (!resp || !resp.ok) throw new Error('fetch failed');
+                                  return resp.blob();
+                                }).then(function(blob) {
+                                  var fr = new FileReader();
+                                  fr.onloadend = function() { resolve(String(fr.result || '')); };
+                                  fr.onerror = function() { reject(new Error('filereader error')); };
+                                  fr.readAsDataURL(blob);
+                                }).catch(reject);
+                              } catch (err) { reject(err); }
+                            });
+                          };
+
+                          // Composita foto + cornice in formato Canon Selphy (1200x1800, portrait 4"x6" a 300dpi)
+                          var __compositeSelphy = function(dataUrl) {
+                            return new Promise(function(resolve) {
+                              try {
+                                var SW = 1200, SH = 1800;
+                                var cvs = document.createElement('canvas');
+                                cvs.width = SW; cvs.height = SH;
+                                var ctx = cvs.getContext('2d');
+                                // Ottieni src della cornice - cerca in ordine di affidabilità
+                                var fSrc = '';
+                                // 1) ms-preview-frame-ov: è visibile durante la preview/save con src piena
+                                try {
+                                  var fPrev = document.getElementById('ms-preview-frame-ov');
+                                  if (fPrev && fPrev.src && fPrev.src.indexOf('data:') === 0) fSrc = fPrev.src;
+                                  console.log('[ms] composite: preview-frame-ov srcLen=' + fSrc.length);
+                                } catch (_) {}
+                                // 2) ms-session-frame-ov
+                                if (!fSrc) {
+                                  try {
+                                    var fSess = document.getElementById('ms-session-frame-ov');
+                                    if (fSess && fSess.src && fSess.src.indexOf('data:') === 0) fSrc = fSess.src;
+                                    console.log('[ms] composite: session-frame-ov srcLen=' + fSrc.length);
+                                  } catch (_) {}
+                                }
+                                // 3) __msResolveFrameUrl legge direttamente da localStorage
+                                if (!fSrc) {
+                                  try {
+                                    if (typeof window.__msResolveFrameUrl === 'function') {
+                                      var resolved = String(window.__msResolveFrameUrl() || '');
+                                      if (resolved && resolved.indexOf('data:') === 0) fSrc = resolved;
+                                      console.log('[ms] composite: resolveUrl srcLen=' + fSrc.length);
+                                    }
+                                  } catch (_) {}
+                                }
+                                // 4) _msLocalFrames
+                                if (!fSrc) {
+                                  try {
+                                    var selName = getSelectedFrameName();
+                                    var frames = window._msLocalFrames || [];
+                                    console.log('[ms] composite: localFrames count=' + frames.length + ' sel=' + selName);
+                                    for (var fi = 0; fi < frames.length; fi++) {
+                                      if (!selName || frames[fi].name === selName) { fSrc = frames[fi].url || ''; break; }
+                                    }
+                                    console.log('[ms] composite: localFrames fSrcLen=' + fSrc.length);
+                                  } catch (_) {}
+                                }
+                                var drawFrame = function() {
+                                  if (!fSrc) {
+                                    console.log('[ms] composite: no frame src, saving photo only');
+                                    resolve(cvs.toDataURL('image/jpeg', 0.95)); return;
+                                  }
+                                  var fImg = new Image();
+                                  fImg.onload = function() {
+                                    try {
+                                      ctx.drawImage(fImg, 0, 0, SW, SH);
+                                      var result = cvs.toDataURL('image/jpeg', 0.95);
+                                      console.log('[ms] composite: done size=' + Math.round(result.length / 1024) + 'KB');
+                                      resolve(result);
+                                    } catch (e) { console.log('[ms] composite drawFrame err: ' + e.message); resolve(cvs.toDataURL('image/jpeg', 0.95)); }
+                                  };
+                                  fImg.onerror = function() { console.log('[ms] composite: fImg onerror'); resolve(cvs.toDataURL('image/jpeg', 0.95)); };
+                                  fImg.src = fSrc;
+                                };
+                                var pImg = new Image();
+                                pImg.onload = function() {
+                                  try {
+                                    var sw = pImg.naturalWidth, sh = pImg.naturalHeight;
+                                    console.log('[ms] composite: pImg loaded ' + sw + 'x' + sh);
+                                    var ratio = SW / SH, srcRatio = sw / sh;
+                                    var sx = 0, sy = 0, cw = sw, ch = sh;
+                                    if (srcRatio > ratio) { cw = Math.round(sh * ratio); sx = Math.round((sw - cw) / 2); }
+                                    else if (srcRatio < ratio) { ch = Math.round(sw / ratio); sy = Math.round((sh - ch) / 2); }
+                                    // Mantieni orientamento identico all'anteprima mostrata all'utente.
+                                    ctx.drawImage(pImg, sx, sy, cw, ch, 0, 0, SW, SH);
+                                    drawFrame();
+                                  } catch (e) { console.log('[ms] composite pImg err: ' + e.message); resolve(dataUrl); }
+                                };
+                                pImg.onerror = function() { console.log('[ms] composite: pImg onerror'); resolve(dataUrl); };
+                                pImg.src = dataUrl;
+                              } catch (e) { console.log('[ms] composite outer err: ' + e.message); resolve(dataUrl); }
+                            });
+                          };
+
+                          if (__lp && window.electronAPI && typeof window.electronAPI.saveCapturedPhoto === 'function') {
+                            __toDataUrlPromise(__lp).then(function(dataUrl) {
+                              if (!dataUrl || dataUrl.indexOf('data:image/') !== 0) return Promise.resolve(dataUrl);
+                              return __compositeSelphy(dataUrl);
+                            }).then(function(composited) {
+                              if (!composited || composited.indexOf('data:image/') !== 0) { __runFallbackSave(); return; }
+                              return __saveViaIpc(composited);
+                            }).then(function(savedRes) {
+                              return __printSavedOriginal(savedRes).then(function() { return savedRes; });
+                            }).then(function() {
+                              try {
+                                // Evita che il flusso remoto stampi l'anteprima con formato errato.
+                                var __cb2 = __msGetPrintCheckbox();
+                                if (__cb2) __cb2.checked = false;
+                                var __stBtn2 = document.getElementById('ms-btn-stampa');
+                                if (__stBtn2) __stBtn2.setAttribute('data-checked', '0');
+                              } catch (_) {}
+                              __runFallbackSave();
+                            }).catch(function() {
+                              __runFallbackSave();
+                            });
+                          } else {
+                            __runFallbackSave();
                           }
                         } catch (_) {}
                       });
@@ -2826,7 +3671,64 @@ function injectRemoteUiRedesign(win, targetFrame) {
     window.__msSballandoPremiumV1 = true;
     document.documentElement.setAttribute('data-ms-premium', 'true');
 
-    var _msSessionPersistedAtBoot = ${msSessionModeActive};
+    // ── Photo interceptors ───────────────────────────────────────────────────
+    // Cattura il dataUrl del blob E il canvas APPENA viene scattata la foto,
+    // così il bottone Salva può usarli anche se il blob URL viene revocato o
+    // se la pagina non fa un download locale.
+    if (!window.__msBlobInterceptorV1) {
+      window.__msBlobInterceptorV1 = true;
+
+      // 1) Intercetta URL.createObjectURL (blob → dataUrl via FileReader)
+      var __origCOU = URL.createObjectURL;
+      URL.createObjectURL = function(obj) {
+        var result = __origCOU.call(URL, obj);
+        try {
+          if (obj && obj.type && String(obj.type).indexOf('image/') === 0 && obj.size > 10000) {
+            var fr = new FileReader();
+            fr.onloadend = function() {
+              var du = String(fr.result || '');
+              if (du && du.indexOf('data:image/') === 0) {
+                window.__msLastBlobDataUrl = du;
+                console.log('[ms] blob intercepted size=' + Math.round(du.length / 1024) + 'KB');
+              }
+            };
+            fr.readAsDataURL(obj);
+          }
+        } catch (_) {}
+        return result;
+      };
+
+      // 2) Intercetta canvas.toBlob → salva riferimento al canvas
+      var __origToBlob = HTMLCanvasElement.prototype.toBlob;
+      HTMLCanvasElement.prototype.toBlob = function(cb, type, quality) {
+        var self = this;
+        try {
+          if (self.width > 100 && self.height > 100) {
+            window.__msLastPhotoCanvas = self;
+            console.log('[ms] canvas.toBlob intercepted ' + self.width + 'x' + self.height);
+          }
+        } catch (_) {}
+        return __origToBlob.call(self, cb, type, quality);
+      };
+
+      // 3) Intercetta canvas.toDataURL → salva dataUrl direttamente
+      var __origToDU = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+        var result = __origToDU.call(this, type, quality);
+        try {
+          if (this.width > 100 && this.height > 100 && result && result.indexOf('data:image/') === 0) {
+            window.__msLastBlobDataUrl = result;
+            window.__msLastPhotoCanvas = this;
+            console.log('[ms] canvas.toDataURL intercepted size=' + Math.round(result.length / 1024) + 'KB');
+          }
+        } catch (_) {}
+        return result;
+      };
+    }
+
+    // Determina lo stato sessione dall'URL corrente (evita il race condition del main process)
+    var __pn = window.location.pathname;
+    var _msSessionPersistedAtBoot = (__pn.indexOf('/mirror/index') >= 0 && __pn !== '/mirror/index.php');
     if (_msSessionPersistedAtBoot) document.documentElement.setAttribute('data-ms-session', '1');
 
     // â”€â”€ FONT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2849,7 +3751,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         display: flex; flex-direction: column;
         font-family: 'Inter', system-ui, -apple-system, sans-serif;
         color: #f8f9fa; z-index: 2147480000; overflow: hidden; user-select: none;
-        transition: none;
+        transition: opacity 180ms ease-out;
       }
       html[data-ms-session="1"] #ms-app { display: none !important; pointer-events: none !important; z-index: -1 !important; }
       #ms-app.ms-app-out { opacity: 0 !important; pointer-events: none !important; }
@@ -2869,17 +3771,26 @@ function injectRemoteUiRedesign(win, targetFrame) {
       .ms-dot.online  { background: #22c55e; box-shadow: 0 0 7px rgba(34,197,94,0.6); }
       .ms-dot.offline { background: #ef4444; }
       .ms-dot.warning { background: #f59e0b; }
-      #ms-preview-wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 14px 20px 8px; }
-      #ms-preview-inner { position: relative; aspect-ratio: 2/3; height: 100%; max-height: 100%; max-width: 100%; border-radius: 20px; overflow: hidden; background: #000; box-shadow: 0 20px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07); }
+      .ms-tb-sep { width: 1px; height: 22px; background: rgba(255,255,255,0.10); margin: 0 4px; }
+      .ms-tb-cta { display: inline-flex; align-items: center; gap: 7px; padding: 8px 16px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; border-radius: 10px; cursor: pointer; font-family: inherit; transition: background 0.18s, transform 0.12s, box-shadow 0.18s, border-color 0.18s; border: 1px solid rgba(255,255,255,0.16); background: rgba(255,255,255,0.06); color: #fff; }
+      .ms-tb-cta:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.30); transform: translateY(-1px); }
+      .ms-tb-cta:active { transform: scale(0.97); }
+      .ms-tb-cta-primary { background: #E63946; border-color: rgba(230,57,70,0.85); box-shadow: 0 4px 18px rgba(230,57,70,0.40); }
+      .ms-tb-cta-primary:hover { background: #c62828; border-color: rgba(230,57,70,1); box-shadow: 0 6px 24px rgba(230,57,70,0.55); }
+      .ms-tb-cta-primary:disabled, .ms-tb-cta:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+      /* Vecchi pulsanti dentro al preview: nascosti, ora vivono nel topbar */
+      #ms-start-btn, #ms-gallery-btn { display: none !important; }
+      #ms-preview-wrap { flex: 0 0 auto; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 14px 20px 8px; }
+      #ms-preview-inner { position: relative; aspect-ratio: 2/3; height: 420px; max-height: 44vh; max-width: 100%; border-radius: 20px; overflow: hidden; background: #000; box-shadow: 0 20px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07); }
       #ms-cam-video { width: 100%; height: 100%; object-fit: cover; display: block; transform: scaleX(-1); -webkit-transform: scaleX(-1); }
       #ms-selphy-badge { position: absolute; bottom: 52px; left: 14px; z-index: 5; background: rgba(230,57,70,0.85); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 700; color: #fff; letter-spacing: 0.07em; pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.5); box-shadow: 0 2px 10px rgba(230,57,70,0.4); }
-      #ms-safe-area { position: absolute; inset: 3.5%; z-index: 4; pointer-events: none; border: 2px dashed rgba(255,255,255,0.7); border-radius: 4px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.35); }
+      #ms-safe-area { position: absolute; inset: 0; z-index: 4; pointer-events: none; border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; box-shadow: none; }
       #ms-safe-area::before, #ms-safe-area::after { content: ''; position: absolute; width: 20px; height: 20px; border-color: #fff; border-style: solid; }
       #ms-safe-area::before { top: -2px; left: -2px; border-width: 3px 0 0 3px; border-radius: 3px 0 0 0; }
       #ms-safe-area::after { bottom: -2px; right: -2px; border-width: 0 3px 3px 0; border-radius: 0 0 3px 0; }
       #ms-safe-area-br { position: absolute; bottom: -2px; left: -2px; width: 20px; height: 20px; border: 3px solid #fff; border-width: 0 0 3px 3px; border-radius: 0 0 0 3px; z-index: 4; pointer-events: none; }
       #ms-safe-area-tr { position: absolute; top: -2px; right: -2px; width: 20px; height: 20px; border: 3px solid #fff; border-width: 3px 3px 0 0; border-radius: 0 3px 0 0; z-index: 4; pointer-events: none; }
-      #ms-safe-label { position: absolute; top: calc(3.5% + 8px); left: 50%; transform: translateX(-50%); z-index: 5; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; color: rgba(255,255,255,0.75); text-transform: uppercase; pointer-events: none; white-space: nowrap; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+      #ms-safe-label { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; color: rgba(255,255,255,0.75); text-transform: uppercase; pointer-events: none; white-space: nowrap; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
       #ms-frame-ov { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 2; pointer-events: none; display: none; }
       #ms-preview-grad { position: absolute; bottom: 0; left: 0; right: 0; height: 90px; background: linear-gradient(transparent, rgba(0,0,0,0.55)); z-index: 3; pointer-events: none; }
       #ms-start-btn {
@@ -2892,6 +3803,20 @@ function injectRemoteUiRedesign(win, targetFrame) {
       }
       #ms-start-btn:hover { background: #c62828; transform: scale(1.04); box-shadow: 0 6px 28px rgba(230,57,70,0.6); }
       #ms-start-btn:active { transform: scale(0.97); }
+      #ms-gallery-btn {
+        position: absolute; top: 62px; right: 14px; z-index: 10;
+        background: rgba(22,22,28,0.82); color: #fff; border: 1px solid rgba(255,255,255,0.16); border-radius: 10px;
+        padding: 8px 14px; font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+        cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+        transition: background 0.2s, transform 0.15s, border-color 0.2s; font-family: inherit;
+      }
+      #ms-gallery-btn:hover { background: rgba(30,30,40,0.92); border-color: rgba(255,255,255,0.28); transform: translateY(-1px); }
+      #ms-gallery-btn:active { transform: scale(0.97); }
+      #ms-id-watermark {
+        position: absolute; right: 16px; bottom: 14px; z-index: 6; pointer-events: none;
+        color: rgba(255,255,255,0.85); font-size: 22px; font-weight: 700; letter-spacing: 0.08em;
+        text-shadow: 0 2px 14px rgba(0,0,0,0.8), 0 0 2px rgba(0,0,0,0.85);
+      }
       #ms-panel {
         display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
         padding: 8px 20px 18px; flex-shrink: 0; overflow-y: auto; max-height: 42%;
@@ -2914,6 +3839,14 @@ function injectRemoteUiRedesign(win, targetFrame) {
       .ms-sel:hover { border-color: rgba(255,255,255,0.25); background-color: rgba(255,255,255,0.1); }
       .ms-sel:focus { border-color: #E63946; outline: none; }
       .ms-sel option { background: #1a1a2e; color: #f8f9fa; }
+      .ms-inp {
+        width: 100%; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
+        color: #f8f9fa; font-size: 13px; font-weight: 500; padding: 9px 12px;
+        outline: none; transition: border-color 0.2s, background-color 0.2s; font-family: inherit;
+      }
+      .ms-inp::placeholder { color: rgba(255,255,255,0.45); }
+      .ms-inp:hover { border-color: rgba(255,255,255,0.25); background-color: rgba(255,255,255,0.1); }
+      .ms-inp:focus { border-color: #E63946; }
       .ms-tr { display: flex; align-items: center; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
       .ms-tr:last-child { border-bottom: none; padding-bottom: 0; }
       .ms-tr:first-of-type { padding-top: 0; }
@@ -2945,6 +3878,1050 @@ function injectRemoteUiRedesign(win, targetFrame) {
       html[data-ms-nav="1"] #ms-nav-mask { display: none; opacity: 0; }
       #ms-toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #E63946; color: #fff; font-size: 13px; font-weight: 600; padding: 12px 20px; border-radius: 10px; z-index: 9999999; pointer-events: none; opacity: 0; transition: opacity 0.25s; white-space: nowrap; font-family: inherit; max-width: 90vw; text-align: center; word-break: break-word; white-space: normal; }
       #ms-toast.show { opacity: 1; }
+      #ms-gallery-modal { position: fixed; inset: 0; z-index: 2147483500; display: none; align-items: center; justify-content: center; background: rgba(3,3,3,0.76); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); opacity: 0; transition: opacity 0.25s cubic-bezier(.22,.9,.25,1); }
+      #ms-gallery-modal.show { opacity: 1; }
+      #ms-gallery-card { width: 90vw; height: 80vh; max-width: 1680px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.08); background: rgba(20,20,20,0.75); box-shadow: 0 30px 90px rgba(0,0,0,0.62), 0 0 0 1px rgba(255,59,92,0.08), 0 0 36px rgba(255,59,92,0.10); display: flex; flex-direction: column; overflow: hidden; transform: translateY(10px) scale(0.985); transition: transform 0.25s cubic-bezier(.22,.9,.25,1); }
+      #ms-gallery-modal.show #ms-gallery-card { transform: translateY(0) scale(1); }
+      #ms-gallery-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.06); background: rgba(14,14,14,0.55); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+      .ms-gh-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+      .ms-gh-icon { width: 36px; height: 36px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; color: #fff; background: radial-gradient(circle at 35% 35%, rgba(255,59,92,0.55), rgba(255,59,92,0.12)); border: 1px solid rgba(255,255,255,0.16); box-shadow: 0 0 20px rgba(255,59,92,0.22); }
+      .ms-gh-text { min-width: 0; display: flex; flex-direction: column; }
+      #ms-gallery-title { color: #ffffff; font-size: 20px; font-weight: 800; letter-spacing: 0.01em; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #ms-gallery-subtitle { color: #aaaaaa; font-size: 12px; font-weight: 500; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #ms-gallery-close { width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.36); color: #fff; cursor: pointer; transition: background 0.2s, transform 0.2s, border-color 0.2s; }
+      #ms-gallery-close:hover { background: rgba(255,59,92,0.28); border-color: rgba(255,59,92,0.75); transform: scale(1.06); }
+      #ms-gallery-chips { display: flex; align-items: center; gap: 8px; padding: 10px 16px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); background: rgba(10,10,10,0.28); overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.22) transparent; }
+      #ms-gallery-chips::-webkit-scrollbar { height: 7px; }
+      #ms-gallery-chips::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.22); border-radius: 999px; }
+      #ms-gallery-chips::-webkit-scrollbar-track { background: transparent; }
+      .ms-g-chip { border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; background: rgba(16,16,24,0.66); color: #f5f5f5; font-size: 11px; font-weight: 700; padding: 6px 12px; cursor: pointer; white-space: nowrap; transition: transform 0.2s, border-color 0.2s, background 0.2s; }
+      .ms-g-chip:hover { transform: translateY(-1px); border-color: rgba(255,59,92,0.48); background: rgba(28,28,36,0.8); }
+      #ms-gallery-grid { position: relative; display: flex; flex-direction: column; gap: 16px; padding: 14px 18px 16px; flex: 1; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.18) transparent; }
+      #ms-gallery-grid::-webkit-scrollbar { width: 8px; }
+      #ms-gallery-grid::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.18); border-radius: 999px; }
+      #ms-gallery-grid::-webkit-scrollbar-track { background: transparent; }
+      .ms-g-section { position: relative; border-radius: 16px; border: 1px solid rgba(255,255,255,0.06); background: linear-gradient(180deg, rgba(18,18,22,0.50), rgba(10,10,12,0.62)); padding: 10px 10px 12px; }
+      .ms-g-section:nth-child(odd) { background: linear-gradient(180deg, rgba(20,18,24,0.52), rgba(11,10,14,0.64)); }
+      .ms-g-section-head { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -2px 2px 8px; padding: 6px 8px; border-radius: 10px; background: rgba(8,8,10,0.58); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+      .ms-g-section-title { color: #f4f4f4; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; }
+      .ms-g-section-sub { color: #b8b8c6; font-size: 11px; font-weight: 600; }
+      .ms-g-section-line { height: 1px; margin-top: 6px; background: linear-gradient(90deg, rgba(255,59,92,0.28), rgba(255,255,255,0.06)); }
+      .ms-g-row { display: flex; align-items: stretch; gap: 20px; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; padding: 6px 2px 4px; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.22) transparent; }
+      .ms-g-row::-webkit-scrollbar { height: 8px; }
+      .ms-g-row::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.22); border-radius: 999px; }
+      .ms-g-row::-webkit-scrollbar-track { background: transparent; }
+      .ms-g-item { position: relative; flex: 0 0 clamp(240px, 24vw, 300px); width: clamp(240px, 24vw, 300px); min-width: 240px; max-width: 300px; height: clamp(460px, 56vh, 540px); flex-shrink: 0; scroll-snap-align: start; border-radius: 24px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); background: rgba(20,20,20,0.75); box-shadow: 0 12px 34px rgba(0,0,0,0.45); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); transition: transform 0.25s cubic-bezier(.22,.9,.25,1), border-color 0.25s cubic-bezier(.22,.9,.25,1), box-shadow 0.25s cubic-bezier(.22,.9,.25,1); }
+      .ms-g-media { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 18px 14px 70px; }
+      .ms-g-bg { position: absolute; inset: 0; background-size: cover; background-position: center; filter: blur(20px) saturate(0.9); transform: scale(1.08); opacity: 0.48; }
+      .ms-g-bg::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(7,7,7,0.25), rgba(7,7,7,0.62)); }
+      .ms-g-photo { position: relative; z-index: 2; width: 100%; height: 100%; object-fit: contain; object-position: center center; display: block; border-radius: 16px; background: rgba(0,0,0,0.40); padding: 6px; box-sizing: border-box; transform: scale(1); transition: transform 0.25s cubic-bezier(.22,.9,.25,1); }
+      .ms-g-item:hover, .ms-g-item.sel { border-color: rgba(255,59,92,0.72); box-shadow: 0 0 0 1px rgba(255,59,92,0.35), 0 18px 38px rgba(0,0,0,0.55), 0 0 28px rgba(255,59,92,0.16); transform: translateY(-3px) scale(1.015); }
+      .ms-g-item:hover .ms-g-photo, .ms-g-item.sel .ms-g-photo { transform: scale(1.03); }
+      .ms-g-id { position: absolute; top: 10px; left: 10px; padding: 4px 9px; border-radius: 999px; background: rgba(0,0,0,0.60); color: #fff; border: 1px solid rgba(255,255,255,0.16); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+      .ms-g-actions { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; display: flex; gap: 8px; padding: 10px; background: linear-gradient(transparent, rgba(0,0,0,0.74) 38%, rgba(0,0,0,0.90) 100%); }
+      .ms-g-btn { flex: 1; border: 1px solid rgba(255,255,255,0.18); border-radius: 9px; background: rgba(14,14,20,0.72); color: #fff; font-size: 11px; font-weight: 700; padding: 8px 8px; cursor: pointer; transition: transform 0.2s, background 0.2s, border-color 0.2s; }
+      .ms-g-btn:hover { transform: translateY(-1px); background: rgba(26,26,34,0.82); }
+      .ms-g-btn.del { border-color: rgba(255,59,92,0.55); color: #ffc3cf; background: rgba(255,59,92,0.16); }
+      .ms-g-btn.del:hover { border-color: rgba(255,59,92,0.82); background: rgba(255,59,92,0.26); }
+      .ms-g-skel-card { background: linear-gradient(100deg, rgba(28,28,34,0.8) 20%, rgba(42,42,52,0.9) 40%, rgba(28,28,34,0.8) 60%); background-size: 220% 100%; animation: msGSkeleton 1.1s linear infinite; }
+      .ms-g-skel-card::after { content: ''; position: absolute; left: 10px; bottom: 10px; width: 60%; height: 12px; border-radius: 999px; background: rgba(0,0,0,0.28); }
+      @keyframes msGSkeleton { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+      #ms-gallery-empty { display: none; margin: auto; color: #aaaaaa; font-size: 14px; text-align: center; padding: 20px; }
+      #ms-gallery-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 16px 12px; border-top: 1px solid rgba(255,255,255,0.06); background: rgba(10,10,10,0.36); }
+      #ms-gallery-count { color: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: 0.04em; }
+      #ms-gallery-download-all { border: 1px solid rgba(255,255,255,0.16); border-radius: 10px; background: rgba(14,14,20,0.72); color: #fff; font-size: 12px; font-weight: 700; padding: 8px 12px; cursor: pointer; transition: transform 0.2s, border-color 0.2s, background 0.2s; }
+      #ms-gallery-download-all:hover { transform: translateY(-1px); border-color: rgba(255,59,92,0.55); background: rgba(24,24,32,0.85); }
+      @media (max-width: 1280px) { .ms-g-row { gap: 16px; } .ms-g-item { flex-basis: clamp(228px, 28vw, 290px); width: clamp(228px, 28vw, 290px); } }
+      @media (max-width: 980px) { #ms-gallery-card { width: 94vw; height: 84vh; } #ms-gallery-grid { padding: 10px 10px 12px; } .ms-g-row { gap: 12px; } .ms-g-item { flex-basis: clamp(210px, 42vw, 270px); width: clamp(210px, 42vw, 270px); height: clamp(430px, 62vh, 520px); } }
+      #ms-gallery-viewer-modal { position: fixed; inset: 0; z-index: 2147483600; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.86); }
+      #ms-gallery-viewer-card { position: relative; width: min(96vw, 860px); height: min(90vh, 1260px); display: flex; align-items: center; justify-content: center; }
+      #ms-gallery-viewer-media { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; box-shadow: 0 20px 70px rgba(0,0,0,0.7); }
+      .ms-gv-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.26); background: rgba(0,0,0,0.55); color: #fff; font-size: 28px; line-height: 1; cursor: pointer; }
+      #ms-gallery-viewer-prev { left: 12px; }
+      #ms-gallery-viewer-next { right: 12px; }
+      #ms-gallery-viewer-close { position: absolute; top: 10px; right: 10px; width: 36px; height: 34px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.24); background: rgba(0,0,0,0.55); color: #fff; cursor: pointer; }
+      #ms-gallery-viewer-delete { position: absolute; right: 10px; bottom: 10px; border: 1px solid rgba(230,57,70,0.65); border-radius: 8px; background: rgba(230,57,70,0.2); color: #ffd3d8; font-size: 12px; font-weight: 700; padding: 8px 12px; cursor: pointer; }
+      #ms-gallery-viewer-meta { position: absolute; left: 10px; bottom: 10px; color: rgba(255,255,255,0.9); font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-shadow: 0 2px 8px rgba(0,0,0,0.92); }
+      /* Printer status badge in gallery header */
+      #ms-gallery-printer-pill { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.10); background: rgba(16,16,20,0.62); min-width: 180px; max-width: 280px; }
+      #ms-gallery-printer-pill .ms-pp-dot { width: 9px; height: 9px; border-radius: 50%; background: #6b7280; box-shadow: 0 0 0 2px rgba(255,255,255,0.04); transition: background 0.25s, box-shadow 0.25s; flex: 0 0 auto; }
+      #ms-gallery-printer-pill .ms-pp-meta { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+      #ms-gallery-printer-pill .ms-pp-label { color: #f4f4f4; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #ms-gallery-printer-pill .ms-pp-bar { height: 4px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; display: none; }
+      #ms-gallery-printer-pill .ms-pp-fill { height: 100%; width: 0%; border-radius: 999px; background: linear-gradient(90deg, #ffb347, #ff6b6b); transition: width 0.4s ease; }
+      #ms-gallery-printer-pill[data-status="ready"] .ms-pp-dot { background: #22c55e; box-shadow: 0 0 0 4px rgba(34,197,94,0.18); }
+      #ms-gallery-printer-pill[data-status="busy"] .ms-pp-dot { background: #facc15; box-shadow: 0 0 0 4px rgba(250,204,21,0.20); animation: msPpPulse 1.2s ease-in-out infinite; }
+      #ms-gallery-printer-pill[data-status="busy"] .ms-pp-bar { display: block; }
+      #ms-gallery-printer-pill[data-status="error"] .ms-pp-dot { background: #ef4444; box-shadow: 0 0 0 4px rgba(239,68,68,0.22); }
+      #ms-gallery-printer-pill[data-status="offline"] .ms-pp-dot { background: #94a3b8; box-shadow: 0 0 0 4px rgba(148,163,184,0.18); }
+      #ms-gallery-printer-pill[data-status="no-printer"] .ms-pp-dot { background: #6b7280; }
+      @keyframes msPpPulse { 0%,100% { box-shadow: 0 0 0 4px rgba(250,204,21,0.20); } 50% { box-shadow: 0 0 0 8px rgba(250,204,21,0.06); } }
+      /* Topbar mini progress under Stampante indicator */
+      .ms-prt-progress { display: none; width: 80px; height: 3px; border-radius: 999px; background: rgba(255,255,255,0.10); overflow: hidden; margin-left: 6px; align-self: center; }
+      .ms-prt-progress-bar { width: 0%; height: 100%; background: linear-gradient(90deg, #ffb347, #ff6b6b); transition: width 0.4s ease; }
+      #ms-si-prt[data-status="busy"] .ms-prt-progress { display: inline-block; }
+      /* Gallery Stampa button states */
+      .ms-g-btn.open.is-blocked { opacity: 0.55; cursor: not-allowed; filter: grayscale(0.4); }
+      .ms-g-btn.open.is-busy { color: #ffe39a; border-color: rgba(250,204,21,0.55); background: rgba(120,80,20,0.42); cursor: progress; }
+      .ms-g-btn.open.is-busy::after { content: ''; display: inline-block; width: 8px; height: 8px; margin-left: 6px; border-radius: 50%; background: #facc15; animation: msPpPulse 1.1s ease-in-out infinite; vertical-align: middle; }
+      /* Printer dropdown styling refinements */
+      .ms-field-printer .ms-sel { width: 100%; }
+      /* Calibrazione stampa */
+      #ms-c-calibration .ms-ct { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      #ms-c-calibration .ms-cal-hint { font-size: 11px; opacity: 0.65; font-weight: 400; }
+      .ms-cal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; margin: 10px 0 12px; }
+      .ms-cal-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; border-radius: 10px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); }
+      .ms-cal-l { font-size: 12px; opacity: 0.85; }
+      .ms-cal-stepper { display: inline-flex; align-items: center; gap: 4px; }
+      .ms-cal-stepper input { width: 64px; text-align: center; font-variant-numeric: tabular-nums; font-size: 13px; padding: 4px 6px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.35); color: #fff; -moz-appearance: textfield; }
+      .ms-cal-stepper input::-webkit-outer-spin-button, .ms-cal-stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      .ms-cal-btn { width: 26px; height: 26px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.08); color: #fff; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+      .ms-cal-btn:hover { background: rgba(255,255,255,0.14); }
+      .ms-cal-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .ms-cal-action { padding: 7px 14px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; letter-spacing: 0.2px; }
+      .ms-cal-action:hover { background: rgba(255,255,255,0.12); }
+      .ms-cal-action[disabled] { opacity: 0.45; cursor: not-allowed; }
+      .ms-cal-primary { background: linear-gradient(180deg,#3b82f6,#2563eb); border-color: rgba(59,130,246,0.6); }
+      .ms-cal-primary:hover { background: linear-gradient(180deg,#60a5fa,#2563eb); }
+      .ms-cal-ghost { background: transparent; }
+      .ms-cal-status { margin-top: 8px; font-size: 11px; opacity: 0.7; min-height: 14px; }
+      .ms-cal-body { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: start; }
+      @media (max-width: 720px) { .ms-cal-body { grid-template-columns: 1fr; } }
+      .ms-cal-controls { min-width: 0; }
+      .ms-cal-preview-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px; border-radius: 10px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); }
+      .ms-cal-preview-title { font-size: 10px; opacity: 0.65; letter-spacing: 0.4px; text-transform: uppercase; }
+      .ms-cal-preview-stage { padding: 6px; background: repeating-linear-gradient(45deg, rgba(255,255,255,0.03) 0 6px, rgba(255,255,255,0.06) 6px 12px); border-radius: 6px; }
+      #ms-cal-canvas { display: block; background: transparent; }
+      .ms-cal-preview-legend { display: flex; gap: 8px; font-size: 9px; opacity: 0.65; flex-wrap: wrap; justify-content: center; }
+      .ms-cal-preview-legend span { display: inline-flex; align-items: center; gap: 4px; }
+      .ms-cal-lg-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+
+      /* ============================================================
+         PREMIUM REDESIGN — overrides only (no DOM/handler changes)
+         Tema dark cinematic + glassmorphism + glow rosso Sballando
+         ============================================================ */
+      @keyframes msFadeInUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+      @keyframes msAmbientPulse { 0%,100% { opacity: 0.55; } 50% { opacity: 0.85; } }
+
+      /* App background: nero profondo + sfumatura ambient rossa */
+      #ms-app {
+        background:
+          radial-gradient(1200px 700px at 85% -10%, rgba(230,57,70,0.10), transparent 60%),
+          radial-gradient(900px 600px at -10% 110%, rgba(230,57,70,0.07), transparent 55%),
+          linear-gradient(180deg, #07070b 0%, #0a0a10 60%, #08080d 100%) !important;
+      }
+      #ms-app::before {
+        content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+        background-image:
+          radial-gradient(rgba(255,255,255,0.025) 1px, transparent 1px);
+        background-size: 3px 3px;
+        opacity: 0.35;
+      }
+      #ms-app > * { position: relative; z-index: 1; }
+
+      /* Topbar: visual priority refined */
+      #ms-topbar {
+        height: 68px !important;
+        padding: 0 28px !important;
+        background:
+          linear-gradient(180deg, rgba(18,18,24,0.78) 0%, rgba(10,10,14,0.62) 100%) !important;
+        border-bottom: 1px solid rgba(255,255,255,0.07) !important;
+        backdrop-filter: blur(18px) saturate(140%);
+        -webkit-backdrop-filter: blur(18px) saturate(140%);
+        box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.30);
+      }
+      .ms-logo {
+        font-size: 24px !important; font-weight: 800 !important; letter-spacing: -0.02em !important;
+        color: #f5f5f7 !important;
+        text-shadow: 0 0 22px rgba(230,57,70,0.18), 0 1px 0 rgba(0,0,0,0.6);
+      }
+      .ms-logo em { color: #E63946 !important; text-shadow: 0 0 14px rgba(230,57,70,0.55); }
+      .ms-status { gap: 10px !important; margin-left: auto; }
+      .ms-si {
+        padding: 5px 10px; border-radius: 999px;
+        background: rgba(255,255,255,0.025);
+        border: 1px solid rgba(255,255,255,0.05);
+        font-size: 10.5px !important; font-weight: 500 !important;
+        letter-spacing: 0.02em;
+        color: rgba(255,255,255,0.48) !important;
+        transition: background 0.2s, border-color 0.2s, color 0.2s;
+      }
+      .ms-si.active { color: rgba(255,255,255,0.76) !important; background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.09); }
+      .ms-si .ms-dot { width: 6px; height: 6px; opacity: 0.9; }
+      .ms-dot.online { box-shadow: 0 0 0 3px rgba(34,197,94,0.12) !important; }
+      .ms-tb-cta {
+        padding: 10px 16px !important; font-size: 12px !important; border-radius: 11px !important;
+        background: rgba(255,255,255,0.04) !important;
+        border: 1px solid rgba(255,255,255,0.09) !important;
+        backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+      }
+      .ms-tb-cta:hover { background: rgba(255,255,255,0.08) !important; border-color: rgba(255,255,255,0.18) !important; }
+      #ms-gallery-btn-top { min-width: 112px; justify-content: center; color: rgba(255,255,255,0.88) !important; }
+      #ms-calibration-btn-top { min-width: 122px; justify-content: center; color: rgba(255,255,255,0.82) !important; }
+      #ms-calibration-btn-top.is-active {
+        background: rgba(230,57,70,0.20) !important;
+        border-color: rgba(230,57,70,0.45) !important;
+        color: #ffd8dc !important;
+      }
+      #ms-start-btn-top {
+        min-width: 236px;
+        height: 44px;
+        justify-content: center;
+        font-size: 13.5px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.07em !important;
+      }
+      .ms-tb-cta-primary {
+        background: linear-gradient(180deg, #ff4d5c 0%, #d62b3a 100%) !important;
+        border-color: rgba(255,90,103,0.65) !important;
+        box-shadow: 0 10px 26px rgba(230,57,70,0.40), inset 0 1px 0 rgba(255,255,255,0.22) !important;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.35);
+      }
+      .ms-tb-cta-primary:hover {
+        background: linear-gradient(180deg, #ff5d6c 0%, #c91f2f 100%) !important;
+        box-shadow: 0 12px 34px rgba(230,57,70,0.52), inset 0 1px 0 rgba(255,255,255,0.24) !important;
+      }
+      .ms-tb-sep { height: 22px !important; background: rgba(255,255,255,0.05) !important; margin: 0 4px !important; }
+
+      /* === F2.1: drawer e gear button rimossi dalla UI === */
+      #ms-settings-btn, #ms-settings-backdrop, #ms-settings-drawer {
+        display: none !important;
+      }
+
+      /* === F2.1: Quick actions Galleria/Calibrazione nel panel sx === */
+      .ms-panel-actions {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+        margin-bottom: 4px;
+      }
+      .ms-pa-btn {
+        display: inline-flex; align-items: center; gap: 10px;
+        padding: 12px 14px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 14px;
+        color: rgba(255,255,255,0.92);
+        font-size: 13px; font-weight: 600; letter-spacing: 0.02em;
+        text-align: left; cursor: pointer;
+        transition: background 180ms ease, border-color 180ms ease, transform 120ms ease, box-shadow 220ms ease, color 180ms ease;
+      }
+      .ms-pa-btn .ms-pa-ic {
+        width: 32px; height: 32px; flex: 0 0 32px;
+        border-radius: 9px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: rgba(255,255,255,0.82);
+        display: inline-flex; align-items: center; justify-content: center;
+        transition: background 180ms ease, border-color 180ms ease, color 180ms ease;
+      }
+      .ms-pa-btn:hover {
+        background: rgba(230,57,70,0.10);
+        border-color: rgba(230,57,70,0.40);
+        color: #ffd8dc;
+        box-shadow: 0 6px 20px rgba(230,57,70,0.14);
+      }
+      .ms-pa-btn:hover .ms-pa-ic {
+        background: rgba(230,57,70,0.16);
+        border-color: rgba(230,57,70,0.45);
+        color: #ffb3bb;
+      }
+      .ms-pa-btn:active { transform: translateY(1px); }
+      .ms-pa-btn.is-active {
+        background: rgba(230,57,70,0.18);
+        border-color: rgba(230,57,70,0.55);
+        color: #ffd8dc;
+        box-shadow: 0 0 0 1px rgba(230,57,70,0.30);
+      }
+
+      /* === F2.1: Icona prima dei titoli card === */
+      .ms-ct-ic {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 18px; height: 18px;
+        margin-right: 8px;
+        color: rgba(255,90,103,0.90);
+        opacity: 0.95;
+        flex: 0 0 18px;
+      }
+      .ms-ct > span:first-child { display: inline-flex; align-items: center; }
+
+      /* === F2.1: Cornici sotto START MIRROR — strip orizzontale === */
+      #ms-frames-section {
+        width: 100%;
+        max-width: 100%;
+        margin-top: 8px;
+        padding: 14px 6px 10px;
+        flex: 0 0 auto;
+        animation: msFadeInUp 0.6s ease-out both;
+      }
+      .ms-frames-head {
+        display: flex; align-items: center; justify-content: space-between;
+        margin: 0 8px 10px;
+      }
+      .ms-frames-title {
+        display: inline-flex; align-items: center; gap: 8px;
+        font-size: 11px; font-weight: 700; letter-spacing: 0.18em;
+        color: rgba(255,255,255,0.62);
+        text-transform: uppercase;
+      }
+      .ms-frames-title svg { color: rgba(255,90,103,0.85); }
+      .ms-frames-add {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11px; font-weight: 600;
+        padding: 7px 12px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 10px;
+        color: rgba(255,255,255,0.86);
+        cursor: pointer;
+        transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+      }
+      .ms-frames-add:hover {
+        background: rgba(230,57,70,0.14);
+        border-color: rgba(230,57,70,0.45);
+        color: #ffd8dc;
+      }
+
+      /* Override layout della card cornici quando viene spostata sotto START */
+      #ms-c-frames.ms-frames-strip {
+        margin: 0 !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
+        animation: none !important;
+      }
+      #ms-c-frames.ms-frames-strip:hover {
+        background: transparent !important;
+        border: 0 !important; box-shadow: none !important;
+      }
+      #ms-c-frames.ms-frames-strip > .ms-ct { display: none !important; }
+      #ms-c-frames.ms-frames-strip #ms-frames-grid {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        gap: 14px !important;
+        margin-top: 0 !important;
+        padding: 6px 8px 10px !important;
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+        scroll-snap-type: x mandatory;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(230,57,70,0.45) transparent;
+      }
+      #ms-c-frames.ms-frames-strip #ms-frames-grid::-webkit-scrollbar { height: 8px; }
+      #ms-c-frames.ms-frames-strip #ms-frames-grid::-webkit-scrollbar-track { background: transparent; }
+      #ms-c-frames.ms-frames-strip #ms-frames-grid::-webkit-scrollbar-thumb {
+        background: linear-gradient(90deg, rgba(230,57,70,0.45), rgba(230,57,70,0.15));
+        border-radius: 999px;
+      }
+      #ms-c-frames.ms-frames-strip #ms-frames-grid::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(90deg, rgba(230,57,70,0.65), rgba(230,57,70,0.30));
+      }
+
+      #ms-c-frames.ms-frames-strip .ms-fi {
+        position: relative;
+        width: 130px !important;
+        height: 195px !important;
+        border-radius: 14px !important;
+        border: 2px solid rgba(255,255,255,0.10) !important;
+        background: #0a0a0f !important;
+        flex: 0 0 auto !important;
+        scroll-snap-align: start;
+        overflow: hidden !important;
+        cursor: pointer;
+        transition: transform 220ms cubic-bezier(0.22,0.94,0.32,1.0),
+                    border-color 220ms ease,
+                    box-shadow 220ms ease,
+                    filter 220ms ease;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi::after {
+        content: '';
+        position: absolute; inset: 0;
+        background: linear-gradient(180deg, transparent 60%, rgba(0,0,0,0.5) 100%);
+        opacity: 0; transition: opacity 220ms ease;
+        pointer-events: none;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi:hover {
+        transform: translateY(-4px) scale(1.04) !important;
+        border-color: rgba(255,90,103,0.65) !important;
+        box-shadow:
+          0 12px 28px rgba(0,0,0,0.55),
+          0 0 24px rgba(230,57,70,0.30),
+          0 0 0 1px rgba(255,90,103,0.45) !important;
+        filter: brightness(1.05);
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi:hover::after { opacity: 1; }
+      #ms-c-frames.ms-frames-strip .ms-fi.sel {
+        border-color: #ff5d6c !important;
+        box-shadow:
+          0 14px 32px rgba(0,0,0,0.55),
+          0 0 28px rgba(230,57,70,0.45),
+          0 0 0 2px rgba(255,90,103,0.85) !important;
+        transform: translateY(-2px) scale(1.03) !important;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi.sel::before {
+        content: '';
+        position: absolute; top: 7px; right: 7px; z-index: 3;
+        width: 22px; height: 22px;
+        border-radius: 999px;
+        background: #ff4d6d;
+        box-shadow: 0 4px 14px rgba(230,57,70,0.55), 0 0 0 2px rgba(0,0,0,0.4);
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'/></svg>");
+        background-repeat: no-repeat;
+        background-position: center;
+      }
+
+      /* Tile "+ Aggiungi" come prima opzione speciale (se presente) */
+      #ms-c-frames.ms-frames-strip .ms-fi-add {
+        display: flex; align-items: center; justify-content: center;
+        font-size: 30px; color: rgba(255,255,255,0.4);
+        background:
+          repeating-linear-gradient(135deg, rgba(255,255,255,0.04) 0 6px, transparent 6px 12px),
+          rgba(255,255,255,0.02) !important;
+        border-style: dashed !important;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi-add:hover {
+        color: #ffd8dc;
+        background:
+          repeating-linear-gradient(135deg, rgba(230,57,70,0.10) 0 6px, transparent 6px 12px),
+          rgba(230,57,70,0.04) !important;
+      }
+
+      /* Highlight-on-card quando una voce viene "puntata" — riusato come flash highlight */
+      .ms-card.ms-sd-target {
+        animation: ms-sd-pulse 1100ms ease;
+        border-color: rgba(230,57,70,0.55) !important;
+        box-shadow: 0 0 0 1px rgba(230,57,70,0.35), 0 16px 38px rgba(230,57,70,0.18) !important;
+      }
+      @keyframes ms-sd-pulse {
+        0%   { box-shadow: 0 0 0 0 rgba(230,57,70,0.55); }
+        45%  { box-shadow: 0 0 0 6px rgba(230,57,70,0.20); }
+        100% { box-shadow: 0 0 0 1px rgba(230,57,70,0.35), 0 16px 38px rgba(230,57,70,0.18); }
+      }
+
+      /* Preview: technical secondary stage */
+      #ms-preview-wrap {
+        position: relative;
+        padding: 14px 24px 10px !important;
+      }
+      #ms-preview-wrap::before {
+        content: none;
+      }
+      #ms-preview-inner {
+        height: 540px !important; max-height: 56vh !important;
+        border-radius: 18px !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        background: #08090d !important;
+        box-shadow:
+          0 12px 30px rgba(0,0,0,0.52),
+          0 0 0 1px rgba(255,255,255,0.04) !important;
+      }
+      #ms-preview-inner::after {
+        content: ''; position: absolute; inset: 0; pointer-events: none; border-radius: inherit;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), inset 0 -28px 45px rgba(0,0,0,0.28);
+      }
+      #ms-cam-video { filter: saturate(0.84) brightness(0.82) contrast(0.94); }
+      #ms-frame-ov { opacity: 0.86; }
+      #ms-selphy-badge {
+        background: rgba(18,18,26,0.62) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        color: rgba(255,255,255,0.75) !important;
+        box-shadow: none !important;
+      }
+      #ms-safe-area,
+      #ms-safe-area-br,
+      #ms-safe-area-tr,
+      #ms-safe-area::before,
+      #ms-safe-area::after { opacity: 0.42; }
+      #ms-safe-label { opacity: 0.56; letter-spacing: 0.10em !important; }
+
+      /* ============== Calibrazione stampa — modal pro ============== */
+      #ms-calibration-backdrop {
+        position: fixed; inset: 0; z-index: 2147483400;
+        background: rgba(4,4,8,0.78);
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        display: none;
+      }
+      #ms-c-calibration { display: none; }
+      #ms-c-calibration.ms-open {
+        display: block !important;
+        position: fixed !important;
+        left: 50% !important; top: 50% !important;
+        transform: translate(-50%, -50%) !important;
+        animation: none !important;
+        width: min(96vw, 1280px) !important;
+        max-height: 92vh !important;
+        overflow: hidden;
+        z-index: 2147483500;
+        padding: 0 !important;
+        background: linear-gradient(180deg, #15161c 0%, #0e0f14 100%) !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        border-radius: 20px !important;
+        box-shadow: 0 30px 80px rgba(0,0,0,0.72), 0 0 0 1px rgba(255,255,255,0.05), 0 0 60px rgba(230,57,70,0.10);
+      }
+      #ms-c-calibration.ms-open .ms-cal-head { display: flex !important; }
+      .ms-cal-head {
+        display: none;
+        align-items: flex-start; justify-content: space-between;
+        gap: 18px;
+        padding: 18px 22px 14px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+      }
+      .ms-cal-head-title { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .ms-cal-head-eyebrow { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #ff6b78; opacity: 0.85; }
+      .ms-cal-head-h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; color: #f5f6fa; }
+      .ms-cal-head-sub { font-size: 12px; color: rgba(255,255,255,0.55); letter-spacing: 0.02em; }
+      #ms-calibration-close {
+        flex: 0 0 auto;
+        width: 32px; height: 32px; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: rgba(255,255,255,0.78);
+        cursor: pointer; font-size: 15px; line-height: 1;
+        display: flex; align-items: center; justify-content: center;
+        transition: background 0.18s, border-color 0.18s, color 0.18s;
+      }
+      #ms-calibration-close:hover { background: rgba(230,57,70,0.18); border-color: rgba(230,57,70,0.5); color: #ffd7db; }
+
+      #ms-c-calibration.ms-open .ms-cal-body {
+        display: grid !important;
+        grid-template-columns: minmax(0, 1fr) 340px !important;
+        grid-template-rows: 1fr !important;
+        gap: 0 !important;
+        padding: 0 !important;
+        height: calc(92vh - 72px) !important;
+        max-height: calc(92vh - 72px) !important;
+        min-height: 520px !important;
+      }
+      #ms-c-calibration.ms-open .ms-cal-stage-col,
+      #ms-c-calibration.ms-open .ms-cal-side { height: 100% !important; min-height: 0 !important; }
+      .ms-cal-stage-col {
+        display: flex; flex-direction: column;
+        min-width: 0; min-height: 0;
+        padding: 14px 18px 16px;
+        gap: 12px;
+        background:
+          radial-gradient(900px 500px at 50% -10%, rgba(230,57,70,0.05), transparent 60%),
+          #0a0b10;
+        border-right: 1px solid rgba(255,255,255,0.05);
+        overflow: hidden;
+      }
+      .ms-cal-stage-toolbar {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 12px; flex-wrap: wrap;
+      }
+      .ms-cal-format-tabs { display: flex; gap: 6px; padding: 4px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; }
+      .ms-cal-tab {
+        font-family: inherit; font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em;
+        padding: 7px 12px; border-radius: 9px;
+        background: transparent; color: rgba(255,255,255,0.62);
+        border: 1px solid transparent; cursor: pointer;
+        transition: background 0.16s, color 0.16s, border-color 0.16s;
+      }
+      .ms-cal-tab:hover { color: #fff; background: rgba(255,255,255,0.05); }
+      .ms-cal-tab.is-active {
+        background: linear-gradient(180deg, rgba(230,57,70,0.22), rgba(230,57,70,0.10));
+        color: #ffd7db;
+        border-color: rgba(230,57,70,0.45);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      .ms-cal-stage-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .ms-cal-mini-toggle {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11px; color: rgba(255,255,255,0.65);
+        padding: 6px 10px; border-radius: 9px;
+        background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+        cursor: pointer; user-select: none;
+      }
+      .ms-cal-mini-toggle input { accent-color: #ef4444; transform: translateY(0.5px); }
+      .ms-cal-zoom { display: inline-flex; align-items: center; gap: 4px; padding: 4px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 9px; }
+      .ms-cal-zoom-btn { width: 24px; height: 24px; border-radius: 6px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); color: #fff; font-weight: 700; cursor: pointer; line-height: 1; }
+      .ms-cal-zoom-btn:hover { background: rgba(230,57,70,0.18); border-color: rgba(230,57,70,0.4); }
+      #ms-cal-zoom-val { font-size: 11px; min-width: 38px; text-align: center; color: rgba(255,255,255,0.78); font-variant-numeric: tabular-nums; }
+
+      .ms-cal-stage {
+        position: relative;
+        flex: 1 1 auto; min-height: 0;
+        display: flex; align-items: safe center; justify-content: safe center;
+        background:
+          radial-gradient(closest-side at 50% 40%, rgba(255,255,255,0.04), transparent 70%),
+          repeating-linear-gradient(45deg, rgba(255,255,255,0.018) 0 12px, rgba(255,255,255,0.030) 12px 24px);
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.05);
+        overflow: auto;
+      }
+      #ms-cal-canvas {
+        display: block;
+        max-width: none; max-height: none;
+        transform-origin: top left;
+        filter: drop-shadow(0 22px 38px rgba(0,0,0,0.55)) drop-shadow(0 4px 10px rgba(0,0,0,0.4));
+      }
+      .ms-cal-coords {
+        position: absolute; left: 14px; bottom: 12px;
+        font-size: 11px; color: rgba(255,255,255,0.65);
+        background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.08);
+        padding: 5px 9px; border-radius: 7px;
+        font-variant-numeric: tabular-nums; pointer-events: none;
+      }
+
+      .ms-cal-legend {
+        display: flex; flex-wrap: wrap; gap: 8px 16px;
+        font-size: 11px; color: rgba(255,255,255,0.7);
+        padding: 8px 4px 0;
+      }
+      .ms-cal-legend span { display: inline-flex; align-items: center; gap: 6px; }
+      .ms-cal-lg-sw { width: 14px; height: 10px; border-radius: 3px; display: inline-block; }
+      .ms-lg-paper { background: rgba(255,255,255,0.95); border: 1px solid rgba(255,255,255,0.4); }
+      .ms-lg-print { background: #ffffff; border: 1px dashed rgba(0,0,0,0.55); box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15); }
+      .ms-lg-safe { background: rgba(34,197,94,0.35); border: 1px dashed #22c55e; }
+      .ms-lg-crop { background: rgba(239,68,68,0.30); border: 1px dashed #ef4444; }
+
+      .ms-cal-side {
+        display: flex; flex-direction: column; gap: 14px;
+        padding: 16px 18px 18px;
+        overflow: auto;
+        background: rgba(255,255,255,0.012);
+      }
+      .ms-cal-side::-webkit-scrollbar { width: 8px; }
+      .ms-cal-side::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 999px; }
+      .ms-cal-section {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 14px;
+        padding: 12px 14px;
+      }
+      .ms-cal-section-title {
+        font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+        color: rgba(255,255,255,0.5); margin-bottom: 10px;
+      }
+      .ms-cal-paper-info {
+        font-size: 12px; line-height: 1.55; color: rgba(255,255,255,0.78);
+        font-variant-numeric: tabular-nums;
+      }
+      .ms-cal-paper-info b { color: #fff; font-weight: 600; }
+
+      .ms-cal-slider-row { display: flex; flex-direction: column; gap: 6px; padding: 6px 0; }
+      .ms-cal-slider-row + .ms-cal-slider-row { border-top: 1px dashed rgba(255,255,255,0.05); padding-top: 12px; margin-top: 6px; }
+      .ms-cal-slider-label { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: rgba(255,255,255,0.78); }
+      .ms-cal-slider-val { font-variant-numeric: tabular-nums; color: #fff; font-weight: 600; }
+      .ms-cal-slider-wrap { padding: 4px 0; }
+      .ms-cal-slider-wrap input[type=range] {
+        -webkit-appearance: none; appearance: none;
+        width: 100%; height: 4px; border-radius: 4px;
+        background: linear-gradient(90deg, rgba(255,255,255,0.10), rgba(255,255,255,0.20));
+        outline: none; cursor: pointer;
+      }
+      .ms-cal-slider-wrap input[type=range]::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none;
+        width: 18px; height: 18px; border-radius: 50%;
+        background: linear-gradient(180deg, #ff6171, #d62b3a);
+        border: 2px solid #fff;
+        box-shadow: 0 4px 14px rgba(230,57,70,0.45);
+        cursor: pointer;
+      }
+      .ms-cal-slider-axis { display: flex; justify-content: space-between; font-size: 10px; color: rgba(255,255,255,0.4); font-variant-numeric: tabular-nums; }
+
+      #ms-c-calibration .ms-cal-actions { display: flex !important; flex-wrap: wrap; gap: 8px; }
+      #ms-c-calibration .ms-cal-action { padding: 9px 14px !important; font-size: 12px !important; border-radius: 10px !important; }
+      #ms-c-calibration .ms-cal-status { font-size: 11.5px !important; opacity: 0.7 !important; padding-top: 8px; min-height: 16px; }
+
+      @media (max-width: 880px) {
+        #ms-c-calibration.ms-open .ms-cal-body {
+          grid-template-columns: 1fr !important;
+          height: auto !important; max-height: calc(92vh - 72px) !important;
+          overflow: auto !important;
+        }
+        .ms-cal-stage-col { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.05); }
+      }
+
+      /* === F2: Layout principale 2 colonne (panel sx, preview+CTA dx) === */
+      #ms-app {
+        display: grid !important;
+        grid-template-rows: auto 1fr !important;
+        grid-template-columns: minmax(320px, 380px) 1fr !important;
+        grid-template-areas:
+          "topbar topbar"
+          "panel  preview" !important;
+        gap: 0 !important;
+      }
+      #ms-topbar { grid-area: topbar; }
+      #ms-panel { grid-area: panel; }
+      #ms-preview-wrap { grid-area: preview; }
+      #ms-settings-backdrop, #ms-settings-drawer { grid-column: 1 / -1; }
+
+      @media (max-width: 1100px) {
+        #ms-app {
+          grid-template-columns: 300px 1fr !important;
+        }
+      }
+      @media (max-width: 900px) {
+        #ms-app {
+          grid-template-columns: 1fr !important;
+          grid-template-areas:
+            "topbar"
+            "preview"
+            "panel" !important;
+        }
+      }
+
+      /* Stage destra: preview enorme + CTA START sotto (centrato) */
+      #ms-preview-wrap {
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 20px !important;
+        padding: 22px 28px 28px !important;
+        min-height: 0 !important;
+      }
+      #ms-preview-inner {
+        position: relative !important;
+        aspect-ratio: 2 / 3 !important;
+        height: auto !important;
+        width: auto !important;
+        max-width: min(620px, 100%) !important;
+        max-height: calc(100vh - 220px) !important;
+        flex: 0 1 auto !important;
+        min-height: 0 !important;
+        border-radius: 22px !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        background: #08090d !important;
+        overflow: hidden !important;
+        box-shadow:
+          0 32px 70px rgba(0,0,0,0.65),
+          0 0 0 1px rgba(255,255,255,0.04),
+          0 0 80px rgba(230,57,70,0.06) !important;
+        animation: msFadeInUp 0.55s ease-out both !important;
+      }
+      #ms-preview-inner::before {
+        content: ''; position: absolute; inset: -1px; border-radius: inherit;
+        background: linear-gradient(135deg, rgba(255,90,103,0.18), transparent 35%, transparent 70%, rgba(255,90,103,0.10));
+        z-index: 0; pointer-events: none;
+        mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        mask-composite: exclude; -webkit-mask-composite: xor;
+        padding: 1px;
+      }
+
+      /* === F2: START MIRROR come CTA principale === */
+      #ms-start-btn {
+        display: inline-flex !important;
+        position: static !important;
+        margin: 0 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 10px !important;
+        min-width: 320px !important;
+        max-width: 92% !important;
+        height: 64px !important;
+        padding: 0 36px !important;
+        font-size: 15.5px !important;
+        font-weight: 800 !important;
+        letter-spacing: 0.14em !important;
+        text-transform: uppercase;
+        color: #fff !important;
+        border: 0 !important;
+        border-radius: 18px !important;
+        cursor: pointer;
+        background:
+          radial-gradient(120% 220% at 50% 0%, rgba(255,255,255,0.30), transparent 55%),
+          linear-gradient(135deg, #ff4d6d 0%, #e63946 50%, #b8203a 100%) !important;
+        box-shadow:
+          0 14px 36px rgba(230,57,70,0.45),
+          0 4px 12px rgba(230,57,70,0.30),
+          inset 0 1px 0 rgba(255,255,255,0.30),
+          inset 0 -2px 0 rgba(0,0,0,0.18),
+          0 0 0 1px rgba(255,90,103,0.55) !important;
+        transition: transform 140ms ease, box-shadow 220ms ease, filter 220ms ease;
+        z-index: 4 !important;
+        flex: 0 0 auto !important;
+      }
+      #ms-start-btn::before {
+        content: ''; position: absolute; inset: -2px; border-radius: 20px;
+        background: linear-gradient(120deg, transparent, rgba(255,90,103,0.55), transparent);
+        opacity: 0; filter: blur(14px); z-index: -1;
+        transition: opacity 320ms ease;
+      }
+      #ms-start-btn:hover {
+        transform: translateY(-2px) scale(1.02);
+        filter: brightness(1.06);
+        box-shadow:
+          0 22px 50px rgba(230,57,70,0.58),
+          0 6px 18px rgba(230,57,70,0.40),
+          inset 0 1px 0 rgba(255,255,255,0.36),
+          inset 0 -2px 0 rgba(0,0,0,0.18),
+          0 0 0 1px rgba(255,120,135,0.85) !important;
+      }
+      #ms-start-btn:hover::before { opacity: 1; }
+      #ms-start-btn:active {
+        transform: translateY(1px) scale(0.985);
+        filter: brightness(0.96);
+        box-shadow:
+          0 8px 18px rgba(230,57,70,0.40),
+          inset 0 2px 4px rgba(0,0,0,0.30),
+          0 0 0 1px rgba(255,90,103,0.6) !important;
+      }
+      #ms-start-btn:disabled {
+        opacity: 0.45; cursor: not-allowed; transform: none !important; filter: grayscale(0.4);
+        box-shadow: 0 8px 16px rgba(0,0,0,0.30), inset 0 1px 0 rgba(255,255,255,0.10) !important;
+      }
+      #ms-start-btn svg {
+        width: 18px; height: 18px;
+        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.35));
+      }
+      /* Vecchia regola che lo nascondeva: la annulliamo (ms-gallery-btn resta nascosto) */
+      #ms-gallery-btn { display: none !important; }
+
+      /* Panel layout: più aria, scrollbar custom */
+      #ms-panel {
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 12px !important;
+        padding: 22px 18px 22px !important;
+        min-height: 0 !important;
+        max-height: none !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        border-right: 1px solid rgba(255,255,255,0.05) !important;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.012) 0%, transparent 30%) !important;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(230,57,70,0.45) transparent;
+      }
+      #ms-panel::-webkit-scrollbar { width: 6px !important; height: 6px !important; }
+      #ms-panel::-webkit-scrollbar-track { background: transparent !important; }
+      #ms-panel::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(230,57,70,0.45), rgba(230,57,70,0.18)) !important; border-radius: 999px !important; }
+      #ms-panel::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, rgba(230,57,70,0.65), rgba(230,57,70,0.30)) !important; }
+
+      /* === F3: Cards compatte premium === */
+      .ms-card {
+        position: relative;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.040) 0%, rgba(255,255,255,0.014) 100%) !important;
+        border: 1px solid rgba(255,255,255,0.07) !important;
+        border-radius: 14px !important;
+        padding: 11px 14px 12px !important;
+        backdrop-filter: blur(14px) saturate(140%) !important;
+        -webkit-backdrop-filter: blur(14px) saturate(140%) !important;
+        box-shadow:
+          0 1px 0 rgba(255,255,255,0.04) inset,
+          0 8px 22px rgba(0,0,0,0.30);
+        transition: border-color 0.22s, transform 0.22s, box-shadow 0.22s, background 0.22s !important;
+        animation: msFadeInUp 0.4s ease-out both;
+      }
+      .ms-card::before {
+        content: '';
+        position: absolute; top: 0; left: 12px; right: 12px; height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(255,90,103,0.30), transparent);
+        opacity: 0; transition: opacity 0.25s;
+        pointer-events: none;
+      }
+      .ms-card:hover {
+        border-color: rgba(255,90,103,0.22) !important;
+        background: linear-gradient(180deg, rgba(255,255,255,0.055) 0%, rgba(255,255,255,0.020) 100%) !important;
+        box-shadow:
+          0 1px 0 rgba(255,255,255,0.06) inset,
+          0 14px 32px rgba(0,0,0,0.42),
+          0 0 22px rgba(230,57,70,0.08);
+      }
+      .ms-card:hover::before { opacity: 0.85; }
+      .ms-card-full { grid-column: 1 / -1; }
+
+      /* Titolo eyebrow */
+      .ms-ct {
+        font-size: 10px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.18em !important;
+        text-transform: uppercase;
+        color: rgba(255,255,255,0.48) !important;
+        margin-bottom: 9px !important;
+        padding-bottom: 7px;
+        border-bottom: 1px solid rgba(255,255,255,0.05);
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      .ms-ct > span:first-child {
+        display: inline-flex; align-items: center;
+      }
+
+      /* Inputs / Selects compatti */
+      .ms-sel, .ms-inp {
+        background: rgba(255,255,255,0.04) !important;
+        border: 1px solid rgba(255,255,255,0.09) !important;
+        border-radius: 10px !important;
+        padding: 9px 12px !important;
+        font-size: 13px !important;
+        transition: border-color 0.18s, background 0.18s, box-shadow 0.18s !important;
+      }
+      .ms-sel { padding-right: 32px !important; }
+      .ms-sel:hover, .ms-inp:hover {
+        background: rgba(255,255,255,0.07) !important;
+        border-color: rgba(255,255,255,0.18) !important;
+      }
+      .ms-sel:focus, .ms-inp:focus {
+        border-color: rgba(230,57,70,0.65) !important;
+        box-shadow: 0 0 0 3px rgba(230,57,70,0.15), 0 0 18px rgba(230,57,70,0.08) !important;
+      }
+      .ms-fl {
+        font-size: 9.5px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.14em !important;
+        text-transform: uppercase;
+        color: rgba(255,255,255,0.46) !important;
+      }
+      .ms-field { gap: 5px !important; margin-bottom: 9px !important; }
+      .ms-field:last-child { margin-bottom: 0 !important; }
+
+      /* Toggle premium */
+      .ms-tog { width: 44px !important; height: 24px !important; }
+      .ms-slider { background: rgba(255,255,255,0.12) !important; border-radius: 999px !important; box-shadow: inset 0 1px 2px rgba(0,0,0,0.35); }
+      .ms-slider::before { width: 18px !important; height: 18px !important; left: 3px !important; top: 3px !important; box-shadow: 0 2px 6px rgba(0,0,0,0.45) !important; }
+      .ms-tog input:checked + .ms-slider {
+        background: linear-gradient(90deg, #d62b3a, #ff5d6c) !important;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.25), 0 0 12px rgba(230,57,70,0.45);
+      }
+      .ms-tog input:checked + .ms-slider::before { transform: translateX(20px) !important; }
+      .ms-tr {
+        padding: 7px 0 !important;
+        border-bottom: 1px solid rgba(255,255,255,0.035);
+      }
+      .ms-tr:last-of-type { border-bottom: 0 !important; }
+      .ms-tl { font-size: 13px !important; font-weight: 500 !important; color: rgba(255,255,255,0.88) !important; }
+
+      /* Path row + choose folder */
+      .ms-path-display {
+        background: rgba(0,0,0,0.32) !important;
+        border: 1px solid rgba(255,255,255,0.07) !important;
+        font-size: 12.5px !important; padding: 10px 14px !important; border-radius: 12px !important;
+        color: rgba(255,255,255,0.78) !important;
+      }
+      #ms-btn-choose-folder {
+        background: linear-gradient(180deg, rgba(230,57,70,0.20), rgba(230,57,70,0.10)) !important;
+        border: 1px solid rgba(230,57,70,0.45) !important;
+        color: #ff8b95 !important;
+        padding: 10px 16px !important;
+        border-radius: 12px !important;
+        transition: transform 0.18s, background 0.18s, border-color 0.18s, box-shadow 0.18s !important;
+      }
+      #ms-btn-choose-folder:hover {
+        background: linear-gradient(180deg, rgba(230,57,70,0.34), rgba(230,57,70,0.18)) !important;
+        border-color: rgba(230,57,70,0.75) !important;
+        transform: translateY(-1px);
+        box-shadow: 0 8px 20px rgba(230,57,70,0.30);
+      }
+
+      /* Calibrazione: grid migliorato + canvas centrale */
+      #ms-c-calibration .ms-cal-body {
+        gap: 16px !important;
+        align-items: start !important;
+      }
+      .ms-cal-grid {
+        grid-template-columns: repeat(3, 1fr) !important;
+        gap: 12px !important;
+        margin: 4px 0 16px !important;
+      }
+      .ms-cal-row {
+        flex-direction: column; align-items: stretch; gap: 8px !important;
+        padding: 10px !important;
+        background: rgba(255,255,255,0.025) !important;
+        border: 1px solid rgba(255,255,255,0.06) !important;
+        border-radius: 12px !important;
+      }
+      .ms-cal-l { font-size: 10.5px !important; letter-spacing: 0.10em !important; text-transform: uppercase; opacity: 0.55 !important; }
+      .ms-cal-stepper { width: 100% !important; justify-content: space-between !important; }
+      .ms-cal-stepper input {
+        flex: 1; text-align: center; font-size: 15px !important; font-weight: 700 !important;
+        background: rgba(0,0,0,0.30) !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        border-radius: 10px !important; padding: 8px 10px !important;
+        color: #fff !important;
+      }
+      .ms-cal-btn {
+        width: 32px !important; height: 32px !important; border-radius: 10px !important;
+        background: rgba(255,255,255,0.05) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        font-size: 16px !important; font-weight: 700 !important;
+        transition: background 0.18s, transform 0.12s, border-color 0.18s !important;
+      }
+      .ms-cal-btn:hover { background: rgba(230,57,70,0.18) !important; border-color: rgba(230,57,70,0.55) !important; }
+      .ms-cal-btn:active { transform: scale(0.92); }
+      .ms-cal-actions { gap: 10px !important; flex-wrap: wrap; }
+      .ms-cal-action {
+        padding: 8px 14px !important; font-size: 12px !important; border-radius: 10px !important;
+        letter-spacing: 0.05em !important;
+        transition: transform 0.18s, background 0.18s, border-color 0.18s, box-shadow 0.18s !important;
+      }
+      .ms-cal-action:not(.ms-cal-primary):not(.ms-cal-ghost) {
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+      }
+      .ms-cal-action:not(.ms-cal-primary):not(.ms-cal-ghost):hover {
+        background: rgba(255,255,255,0.12) !important; border-color: rgba(255,255,255,0.24) !important; transform: translateY(-1px);
+      }
+      .ms-cal-primary {
+        background: linear-gradient(180deg, #ff4d5c 0%, #d62b3a 100%) !important;
+        border: 1px solid rgba(255,90,103,0.65) !important;
+        box-shadow: 0 6px 20px rgba(230,57,70,0.42), inset 0 1px 0 rgba(255,255,255,0.18) !important;
+      }
+      .ms-cal-primary:hover {
+        background: linear-gradient(180deg, #ff5d6c 0%, #c91f2f 100%) !important;
+        transform: translateY(-1px);
+        box-shadow: 0 10px 30px rgba(230,57,70,0.55) !important;
+      }
+      .ms-cal-ghost {
+        background: transparent !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        color: rgba(255,255,255,0.65) !important;
+      }
+      .ms-cal-ghost:hover { background: rgba(255,255,255,0.05) !important; color: #fff !important; border-color: rgba(255,255,255,0.22) !important; }
+      .ms-cal-status { font-size: 11.5px !important; opacity: 0.7 !important; padding-top: 6px; }
+
+      .ms-cal-preview-wrap {
+        padding: 10px !important; gap: 6px !important;
+        border-radius: 16px !important;
+        background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015)) !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.04);
+      }
+      .ms-cal-preview-title {
+        font-size: 11px !important; letter-spacing: 0.14em !important;
+        color: rgba(255,255,255,0.55) !important;
+        padding: 0 6px;
+      }
+      .ms-cal-preview-stage {
+        padding: 8px !important; border-radius: 10px !important;
+        background:
+          repeating-linear-gradient(45deg, rgba(255,255,255,0.025) 0 8px, rgba(255,255,255,0.045) 8px 16px) !important;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+      }
+      .ms-cal-preview-legend { font-size: 10px !important; opacity: 0.6 !important; }
+
+      /* Frames grid */
+      .ms-fi {
+        width: 56px !important; height: 84px !important; border-radius: 10px !important;
+        border-width: 2px !important;
+        transition: transform 0.22s cubic-bezier(.22,1.2,.36,1), border-color 0.22s, box-shadow 0.22s !important;
+      }
+      .ms-fi:hover { transform: scale(1.08) translateY(-2px) !important; box-shadow: 0 10px 22px rgba(0,0,0,0.50); }
+      .ms-fi.sel {
+        border-color: #E63946 !important;
+        box-shadow: 0 0 0 1px rgba(230,57,70,0.4), 0 0 20px rgba(230,57,70,0.55), 0 8px 22px rgba(0,0,0,0.45) !important;
+      }
+      #ms-add-frame-lbl {
+        height: 36px !important; padding: 6px 16px !important;
+        border-radius: 12px !important;
+        border: 1px dashed rgba(255,255,255,0.18) !important;
+      }
+      #ms-add-frame-lbl:hover { border-color: rgba(230,57,70,0.55) !important; color: #ff8b95 !important; }
+
+      /* Toast premium */
+      #ms-toast {
+        background: linear-gradient(180deg, #ff4d5c, #d62b3a) !important;
+        border-radius: 12px !important;
+        box-shadow: 0 10px 30px rgba(230,57,70,0.45), 0 0 0 1px rgba(255,255,255,0.10) inset !important;
+        padding: 14px 22px !important;
+        font-size: 13.5px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.02em !important;
+      }
     \`;
 
     // â”€â”€ HTML OVERLAY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2956,15 +4933,71 @@ function injectRemoteUiRedesign(win, targetFrame) {
           '<div class="ms-logo">s<em>b</em>allando</div>' +
           '<div class="ms-status">' +
             '<div class="ms-si" id="ms-si-cam"><span class="ms-dot" id="ms-d-cam"></span><span>Camera</span></div>' +
-            '<div class="ms-si" id="ms-si-prt"><span class="ms-dot" id="ms-d-prt"></span><span>Stampante</span></div>' +
+            '<div class="ms-si" id="ms-si-prt"><span class="ms-dot" id="ms-d-prt"></span><span id="ms-prt-label">Stampante</span><div class="ms-prt-progress" id="ms-prt-progress"><div class="ms-prt-progress-bar" id="ms-prt-progress-bar"></div></div></div>' +
             '<div class="ms-si" id="ms-si-evt"><span class="ms-dot" id="ms-d-evt"></span><span>Evento</span></div>' +
+            '<div class="ms-tb-sep"></div>' +
+            '<button id="ms-settings-btn" type="button" class="ms-tb-cta" aria-label="Impostazioni" title="Impostazioni">' +
+              '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                '<circle cx="12" cy="12" r="3"></circle>' +
+                '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>' +
+              '</svg>' +
+              '<span>Impostazioni</span>' +
+            '</button>' +
           '</div>' +
         '</div>' +
+        '<div id="ms-settings-backdrop" aria-hidden="true"></div>' +
+        '<aside id="ms-settings-drawer" aria-label="Impostazioni" aria-hidden="true">' +
+          '<div class="ms-sd-head">' +
+            '<div class="ms-sd-title"><span class="ms-sd-eyebrow">Pannello</span><span class="ms-sd-h1">Impostazioni</span></div>' +
+            '<button id="ms-settings-close" type="button" class="ms-sd-close" aria-label="Chiudi">' +
+              '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
+            '</button>' +
+          '</div>' +
+          '<nav class="ms-sd-list">' +
+            '<button type="button" class="ms-sd-item" data-action="gallery">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Galleria</b><em>Sfoglia foto evento</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<button type="button" class="ms-sd-item" data-action="calibration">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Calibrazione</b><em>Allinea stampa Selphy</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<div class="ms-sd-sep"><span>Configurazione</span></div>' +
+            '<button type="button" class="ms-sd-item" data-action="printer">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Stampante</b><em>Seleziona dispositivo di stampa</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<button type="button" class="ms-sd-item" data-action="sounds">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Suoni</b><em>Effetti audio</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<button type="button" class="ms-sd-item" data-action="timing">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Tempi</b><em>Scatto · Inattivit\u00e0</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<button type="button" class="ms-sd-item" data-action="folder">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Cartella salvataggio</b><em>Destinazione foto</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+            '<button type="button" class="ms-sd-item" data-action="advanced">' +
+              '<span class="ms-sd-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></span>' +
+              '<span class="ms-sd-lb"><b>Opzioni avanzate</b><em>Toggle stampa &amp; altro</em></span>' +
+              '<span class="ms-sd-arrow">›</span>' +
+            '</button>' +
+          '</nav>' +
+          '<div class="ms-sd-foot">sballando &middot; v.kiosk</div>' +
+        '</aside>' +
         '<div id="ms-preview-wrap">' +
           '<div id="ms-preview-inner">' +
             '<video id="ms-cam-video" autoplay muted playsinline></video>' +
             '<div id="ms-safe-area"><div id="ms-safe-area-br"></div><div id="ms-safe-area-tr"></div></div>' +
-            '<div id="ms-safe-label">Area di stampa</div>' +
+            '<div id="ms-safe-label">Formato Canon SELPHY 10×15</div>' +
             '<div id="ms-selphy-badge">SELPHY 10×15 · 1200×1800px</div>' +
             '<img id="ms-frame-ov" alt="" />' +
             '<div id="ms-preview-grad"></div>' +
@@ -2972,6 +5005,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
               '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>' +
               'START MIRROR' +
             '</button>' +
+            '<button id="ms-gallery-btn" type="button">Galleria</button>' +
+            '<div id="ms-id-watermark">ID 0001</div>' +
           '</div>' +
         '</div>' +
         '<div id="ms-panel">' +
@@ -2981,6 +5016,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           '</div>' +
           '<div class="ms-card" id="ms-c-evt">' +
             '<div class="ms-ct">Evento</div>' +
+            '<div class="ms-field"><input class="ms-inp" id="ms-evt-search" type="text" placeholder="Cerca evento..." autocomplete="off"></div>' +
             '<select class="ms-sel" id="ms-evt-sel"><option value="">Caricamento\u2026</option></select>' +
           '</div>' +
           '<div class="ms-card ms-card-full" id="ms-c-save">' +
@@ -2994,15 +5030,105 @@ function injectRemoteUiRedesign(win, targetFrame) {
             '<div class="ms-ct">Opzioni</div>' +
             '<div class="ms-tr"><span class="ms-tl">Suoni</span><label class="ms-tog"><input type="checkbox" id="ms-t-sound"><span class="ms-slider"></span></label></div>' +
             '<div class="ms-tr"><span class="ms-tl">Stampa</span><label class="ms-tog"><input type="checkbox" id="ms-t-print"><span class="ms-slider"></span></label></div>' +
+            '<div class="ms-field ms-field-printer"><span class="ms-fl">Stampante</span><select class="ms-sel" id="ms-printer-sel"><option value="">Seleziona stampante…</option></select></div>' +
           '</div>' +
           '<div class="ms-card" id="ms-c-timing">' +
             '<div class="ms-ct">Tempi</div>' +
             '<div class="ms-field"><span class="ms-fl">Scatto (secondi)</span><select class="ms-sel" id="ms-s-countdown"></select></div>' +
             '<div class="ms-field"><span class="ms-fl">Inattivit\u00e0 (minuti)</span><select class="ms-sel" id="ms-s-inactivity"></select></div>' +
           '</div>' +
+          '<div class="ms-card ms-card-full" id="ms-c-calibration">' +
+            '<div class="ms-cal-head">' +
+              '<div class="ms-cal-head-title">' +
+                '<span class="ms-cal-head-eyebrow">Stampa</span>' +
+                '<span class="ms-cal-head-h1">Calibrazione Canon SELPHY CP1500</span>' +
+                '<span class="ms-cal-head-sub" id="ms-cal-format-sub">Postcard 100×148 mm · KP-108</span>' +
+              '</div>' +
+              '<button type="button" id="ms-calibration-close" aria-label="Chiudi calibrazione">✕</button>' +
+            '</div>' +
+            '<div class="ms-cal-body">' +
+              '<div class="ms-cal-stage-col">' +
+                '<div class="ms-cal-stage-toolbar">' +
+                  '<div class="ms-cal-format-tabs" id="ms-cal-format-tabs">' +
+                    '<button type="button" class="ms-cal-tab is-active" data-format="postcard">Postcard 10×15</button>' +
+                    '<button type="button" class="ms-cal-tab" data-format="strip">Photo Strip 5×15</button>' +
+                    '<button type="button" class="ms-cal-tab" data-format="card">Card 54×86</button>' +
+                    '<button type="button" class="ms-cal-tab" data-format="square">Square 72×72</button>' +
+                  '</div>' +
+                  '<div class="ms-cal-stage-tools">' +
+                    '<label class="ms-cal-mini-toggle"><input type="checkbox" id="ms-cal-show-ruler" checked><span>Righelli mm</span></label>' +
+                    '<label class="ms-cal-mini-toggle"><input type="checkbox" id="ms-cal-show-coords" checked><span>Coordinate</span></label>' +
+                    '<div class="ms-cal-zoom"><button type="button" class="ms-cal-zoom-btn" data-zoom-step="-1" aria-label="Riduci zoom anteprima">−</button><span id="ms-cal-zoom-val">100%</span><button type="button" class="ms-cal-zoom-btn" data-zoom-step="1" aria-label="Aumenta zoom anteprima">+</button></div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="ms-cal-stage" id="ms-cal-stage">' +
+                  '<canvas id="ms-cal-canvas" width="460" height="690"></canvas>' +
+                  '<div class="ms-cal-coords" id="ms-cal-coords">— mm</div>' +
+                '</div>' +
+                '<div class="ms-cal-legend">' +
+                  '<span><span class="ms-cal-lg-sw ms-lg-paper"></span>Paper border</span>' +
+                  '<span><span class="ms-cal-lg-sw ms-lg-print"></span>Area stampabile</span>' +
+                  '<span><span class="ms-cal-lg-sw ms-lg-safe"></span>Safe area</span>' +
+                  '<span><span class="ms-cal-lg-sw ms-lg-crop"></span>Crop / rischio taglio</span>' +
+                '</div>' +
+              '</div>' +
+              '<div class="ms-cal-side">' +
+                '<div class="ms-cal-section">' +
+                  '<div class="ms-cal-section-title">Formato carta</div>' +
+                  '<div class="ms-cal-paper-info" id="ms-cal-paper-info">—</div>' +
+                '</div>' +
+                '<div class="ms-cal-section">' +
+                  '<div class="ms-cal-section-title">Offset</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Offset X</span><span class="ms-cal-slider-val" id="ms-cal-x-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-x" min="-5" max="5" step="0.1" value="0"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
+                  '</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Offset Y</span><span class="ms-cal-slider-val" id="ms-cal-y-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-y" min="-5" max="5" step="0.1" value="0"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
+                  '</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Zoom</span><span class="ms-cal-slider-val" id="ms-cal-z-val">100%</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-z" min="80" max="120" step="0.5" value="100"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>80</span><span>100</span><span>120</span></div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="ms-cal-section">' +
+                  '<div class="ms-cal-actions">' +
+                    '<button type="button" id="ms-cal-test" class="ms-cal-action ms-cal-primary">Stampa di test</button>' +
+                    '<button type="button" id="ms-cal-save" class="ms-cal-action">Salva preset</button>' +
+                    '<button type="button" id="ms-cal-reset" class="ms-cal-action ms-cal-ghost">Reset</button>' +
+                  '</div>' +
+                  '<div id="ms-cal-status" class="ms-cal-status">—</div>' +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
           '<div class="ms-card ms-card-full" id="ms-c-frames">' +
             '<div class="ms-ct"><span>Cornici</span><label id="ms-add-frame-lbl" for="ms-frame-file-input">+ Aggiungi<input type="file" id="ms-frame-file-input" accept=".png,.jpg,.jpeg,.webp,.gif" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none;"></label></div>' +
             '<div id="ms-frames-grid"></div>' +
+          '</div>' +
+          '<div id="ms-calibration-backdrop"></div>' +
+          '<div id="ms-gallery-modal">' +
+            '<div id="ms-gallery-card">' +
+              '<div id="ms-gallery-head"><div class="ms-gh-left"><div class="ms-gh-icon">📷</div><div class="ms-gh-text"><div id="ms-gallery-title">Galleria evento</div><div id="ms-gallery-subtitle">-</div></div></div><div id="ms-gallery-printer-pill" class="ms-pp" data-status="no-printer"><span class="ms-pp-dot"></span><div class="ms-pp-meta"><span class="ms-pp-label">Stampante</span><div class="ms-pp-bar"><div class="ms-pp-fill"></div></div></div></div><button id="ms-gallery-close" type="button">✕</button></div>' +
+              '<div id="ms-gallery-chips"></div>' +
+              '<div id="ms-gallery-grid"></div>' +
+              '<div id="ms-gallery-empty">Nessuna foto per questo evento</div>' +
+              '<div id="ms-gallery-foot"><div id="ms-gallery-count">0 foto</div><button id="ms-gallery-download-all" type="button">Scarica tutte</button></div>' +
+            '</div>' +
+          '</div>' +
+          '<div id="ms-gallery-viewer-modal">' +
+            '<div id="ms-gallery-viewer-card">' +
+              '<button id="ms-gallery-viewer-close" type="button">✕</button>' +
+              '<button class="ms-gv-nav" id="ms-gallery-viewer-prev" type="button">‹</button>' +
+              '<img id="ms-gallery-viewer-media" alt="">' +
+              '<button class="ms-gv-nav" id="ms-gallery-viewer-next" type="button">›</button>' +
+              '<div id="ms-gallery-viewer-meta">-</div>' +
+              '<button id="ms-gallery-viewer-delete" type="button">Elimina</button>' +
+            '</div>' +
           '</div>' +
         '</div>';
       document.body.appendChild(appDiv);
@@ -3028,6 +5154,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         sessionFrameOv.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:fill;z-index:2147483000;pointer-events:none;display:none;';
         (document.documentElement || document.body).appendChild(sessionFrameOv);
       }
+
     }
 
     // â”€â”€ HELPERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3159,20 +5286,63 @@ function injectRemoteUiRedesign(win, targetFrame) {
     };
 
     // â”€â”€ CAMERA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    var buildVideoConstraints = function(deviceId) {
+      var base = {
+        width: { ideal: 3840 },
+        height: { ideal: 2160 },
+        frameRate: { ideal: 30, max: 60 },
+        resizeMode: 'none'
+      };
+      if (deviceId) base.deviceId = { exact: deviceId };
+      return base;
+    };
+
+    var bindCameraStream = function(video, stream) {
+      try {
+        video.srcObject = stream;
+        video.setAttribute('playsinline', '');
+        video.setAttribute('autoplay', '');
+        video.setAttribute('muted', '');
+        video.muted = true;
+        var tryPlay = function() {
+          try {
+            var pp = video.play && video.play();
+            if (pp && typeof pp.catch === 'function') pp.catch(function() {});
+          } catch (_) {}
+        };
+        video.onloadedmetadata = tryPlay;
+        setTimeout(tryPlay, 0);
+      } catch (_) {}
+
+      try {
+        var track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+        var st = track && track.getSettings ? track.getSettings() : null;
+        if (st) {
+          console.log('[ms] cam settings ' + (st.width || '?') + 'x' + (st.height || '?') + ' fps=' + (st.frameRate || '?') + ' device=' + (st.deviceId || 'n/a'));
+        }
+      } catch (_) {}
+
+      var d = document.getElementById('ms-d-cam'); if (d) d.className = 'ms-dot online';
+      var si = document.getElementById('ms-si-cam'); if (si) si.classList.add('active');
+    };
+
     var startCamera = function(deviceId) {
       var video = document.getElementById('ms-cam-video');
       if (!video) return;
       if (video.srcObject) { video.srcObject.getTracks().forEach(function(t) { t.stop(); }); video.srcObject = null; }
       if (!deviceId) return;
-      navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } }, audio: false })
+      navigator.mediaDevices.getUserMedia({ video: buildVideoConstraints(deviceId), audio: false })
         .then(function(stream) {
-          video.srcObject = stream;
-          var d = document.getElementById('ms-d-cam'); if (d) d.className = 'ms-dot online';
-          var si = document.getElementById('ms-si-cam'); if (si) si.classList.add('active');
+          bindCameraStream(video, stream);
         })
         .catch(function() {
-          navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-            .then(function(stream) { video.srcObject = stream; })
+          navigator.mediaDevices.getUserMedia({ video: buildVideoConstraints(''), audio: false })
+            .then(function(stream) { bindCameraStream(video, stream); })
+            .catch(function() {
+              navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+                .then(function(stream) { bindCameraStream(video, stream); })
+                .catch(function() {});
+            })
             .catch(function() {});
         });
     };
@@ -3217,27 +5387,86 @@ function injectRemoteUiRedesign(win, targetFrame) {
     };
 
     // â”€â”€ EVENT SELECT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    var MS_LAST_EVT_KEY = 'ms-last-event-text';
+
     var syncEvtSel = function() {
       var ui = document.getElementById('ms-evt-sel');
+      var search = document.getElementById('ms-evt-search');
       var orig = findOrigEventSelect();
       if (!ui || !orig) return;
 
-      var syncCurrentEventFolder = function() {
+      var syncCurrentEventFolder = function(txt) {
         try {
           if (!window.electronAPI || typeof window.electronAPI.setCurrentEventFolder !== 'function') return;
-          var txt = '';
-          if (ui && ui.selectedIndex >= 0 && ui.options && ui.options[ui.selectedIndex]) {
-            txt = String(ui.options[ui.selectedIndex].textContent || '').trim();
+          var t = txt !== undefined ? txt : '';
+          if (!t && ui && ui.selectedIndex >= 0 && ui.options && ui.options[ui.selectedIndex]) {
+            t = String(ui.options[ui.selectedIndex].textContent || '').trim();
           }
-          window.electronAPI.setCurrentEventFolder(txt).catch(function() {});
+          window.electronAPI.setCurrentEventFolder(t).catch(function() {});
         } catch (_) {}
       };
 
-      ui.innerHTML = '';
+      // Recupera la selezione salvata manualmente dall'utente
+      var savedEvtTxt = '';
+      try { savedEvtTxt = String(localStorage.getItem(MS_LAST_EVT_KEY) || '').trim(); } catch (_) {}
+
+      // Non svuotare il dropdown se orig non ha ancora opzioni (potrebbe essere in caricamento)
+      if (!orig.options || orig.options.length === 0) return;
+
+      var applyEvtFilter = function() {
+        var q = '';
+        try { q = String((search && search.value) || '').trim().toLowerCase(); } catch (_) {}
+        var all = Array.isArray(ui.__msAllOptions) ? ui.__msAllOptions : [];
+        var prevVal = ui.value;
+        ui.innerHTML = '';
+        all.forEach(function(it) {
+          if (q && String(it.text || '').toLowerCase().indexOf(q) < 0) return;
+          var o = document.createElement('option');
+          o.value = it.value;
+          o.text = it.text;
+          if (it.selected) o.selected = true;
+          ui.appendChild(o);
+        });
+        if (!ui.value && prevVal) {
+          for (var k = 0; k < ui.options.length; k++) {
+            if (ui.options[k].value === prevVal) { ui.selectedIndex = k; break; }
+          }
+        }
+      };
+
+      ui.__msAllOptions = [];
+      var restoredSaved = false;
       Array.from(orig.options).forEach(function(opt) {
-        var o = document.createElement('option'); o.value = opt.value; o.textContent = opt.textContent;
-        if (opt.selected) o.selected = true; ui.appendChild(o);
+        // opt.text è la proprietà standard HTMLOptionElement per il testo visibile
+        var optDisplay = String(opt.text || opt.textContent || opt.label || '').trim();
+        var selected = false;
+        // Ripristina selezione salvata
+        if (savedEvtTxt && optDisplay === savedEvtTxt) {
+          selected = true;
+          restoredSaved = true;
+        } else if (!savedEvtTxt && opt.selected) {
+          selected = true;
+        }
+        ui.__msAllOptions.push({ value: opt.value, text: optDisplay, selected: selected });
       });
+      applyEvtFilter();
+
+      if (search && !search.dataset.msb) {
+        search.dataset.msb = '1';
+        search.addEventListener('input', function() { applyEvtFilter(); });
+      }
+
+      // Se abbiamo ripristinato la scelta salvata, sincronizza anche il dropdown originale
+      if (restoredSaved && orig) {
+        try {
+          Array.from(orig.options).forEach(function(o) {
+            var od = String(o.text || o.textContent || '').trim();
+            o.selected = od === savedEvtTxt;
+          });
+          orig.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (_) {}
+      }
+
       if (ui.value) {
         var d = document.getElementById('ms-d-evt'); if (d) d.className = 'ms-dot online';
         var si = document.getElementById('ms-si-evt'); if (si) si.classList.add('active');
@@ -3245,15 +5474,33 @@ function injectRemoteUiRedesign(win, targetFrame) {
       if (!ui.dataset.msb) {
         ui.dataset.msb = '1';
         ui.addEventListener('change', function() {
+          var selTxt = '';
+          if (ui.selectedIndex >= 0 && ui.options && ui.options[ui.selectedIndex]) {
+            selTxt = String(ui.options[ui.selectedIndex].text || ui.options[ui.selectedIndex].textContent || '').trim();
+          }
+          // Persisti la scelta dell'utente
+          try { localStorage.setItem(MS_LAST_EVT_KEY, selTxt); } catch (_) {}
           if (orig) { orig.value = ui.value; orig.dispatchEvent(new Event('change', { bubbles: true })); }
-          syncCurrentEventFolder();
+          syncCurrentEventFolder(selTxt);
+          __msRefreshPreviewIdWatermark();
           var hasEvt = !!ui.value;
           var dot = document.getElementById('ms-d-evt'); if (dot) dot.className = 'ms-dot' + (hasEvt ? ' online' : '');
           var si2 = document.getElementById('ms-si-evt'); if (si2) si2.classList.toggle('active', hasEvt);
         });
       }
 
-      syncCurrentEventFolder();
+      // Determina il testo effettivo da usare
+      var effectiveTxt = savedEvtTxt || (ui.selectedIndex >= 0 && ui.options[ui.selectedIndex] ? String(ui.options[ui.selectedIndex].text || ui.options[ui.selectedIndex].textContent || '').trim() : '');
+
+      // Su pagina home (non sessione): salva automaticamente in localStorage così il nome persiste
+      var __ppn = window.location.pathname;
+      var isSessionPage = (__ppn.indexOf('/mirror/index') >= 0 && __ppn !== '/mirror/index.php');
+      if (!isSessionPage && effectiveTxt && !savedEvtTxt) {
+        try { localStorage.setItem(MS_LAST_EVT_KEY, effectiveTxt); console.log('[ms] auto-saved event on home: ' + effectiveTxt); } catch (_) {}
+      }
+
+      syncCurrentEventFolder(effectiveTxt);
+      __msRefreshPreviewIdWatermark();
     };
 
     // â”€â”€ TOGGLES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3365,6 +5612,1218 @@ function injectRemoteUiRedesign(win, targetFrame) {
       btn.dataset.msb = '1'; btn.addEventListener('click', fn);
     };
 
+    var __msGalleryState = { items: [], index: 0, eventText: '', groups: [], slotMinutes: 30, _groupCacheKey: '', _groupCache: [] };
+    var __msGalleryObserver = null;
+
+    // ── PRINTER STATE (single-job gating, real Windows queue monitoring) ──
+    var __msPrinterState = window.__msPrinterState || { printerName: '', status: 'no-printer', label: 'Stampante', jobs: [], hasActiveJob: false, progress: 0, message: '' };
+    window.__msPrinterState = __msPrinterState;
+    var __msPrinterSubscribed = false;
+    var __msPrinterPollTimer = null;
+    var __msPrinterStateListeners = [];
+
+    var __msIsPrinterReady = function() {
+      var s = __msPrinterState || {};
+      return s.status === 'ready' && !s.hasActiveJob;
+    };
+
+    var __msAddPrinterStateListener = function(fn) {
+      if (typeof fn === 'function') __msPrinterStateListeners.push(fn);
+    };
+
+    var __msApplyPrinterStateToUI = function() {
+      var s = __msPrinterState || {};
+      var status = String(s.status || 'no-printer');
+      var label = String(s.label || 'Stampante');
+      var prog = Math.max(0, Math.min(100, Number(s.progress || 0)));
+
+      // Topbar indicator
+      var siPrt = document.getElementById('ms-si-prt');
+      var dotPrt = document.getElementById('ms-d-prt');
+      var lblPrt = document.getElementById('ms-prt-label');
+      var progBar = document.getElementById('ms-prt-progress-bar');
+      if (siPrt) siPrt.setAttribute('data-status', status);
+      if (dotPrt) {
+        dotPrt.className = 'ms-dot' + (status === 'ready' ? ' online' : (status === 'busy' ? ' warn' : (status === 'error' || status === 'offline' ? ' off' : '')));
+      }
+      if (lblPrt) lblPrt.textContent = 'Stampante · ' + label;
+      if (progBar) progBar.style.width = (status === 'busy' ? prog : 0) + '%';
+
+      // Gallery pill
+      var pill = document.getElementById('ms-gallery-printer-pill');
+      if (pill) {
+        pill.setAttribute('data-status', status);
+        var pillLbl = pill.querySelector('.ms-pp-label');
+        var pillFill = pill.querySelector('.ms-pp-fill');
+        if (pillLbl) pillLbl.textContent = (s.printerName ? s.printerName + ' · ' : '') + label;
+        if (pillFill) pillFill.style.width = (status === 'busy' ? prog : 0) + '%';
+      }
+
+      // Gallery print buttons gating
+      var ready = __msIsPrinterReady();
+      var __prefEnabledGallery = true;
+      try {
+        var __prefRawG = localStorage.getItem('msPanelPrintEnabled');
+        if (__prefRawG === '0') __prefEnabledGallery = false;
+        if (__prefRawG === '1') __prefEnabledGallery = true;
+      } catch (_) {}
+      try {
+        Array.from(document.querySelectorAll('.ms-g-btn.open')).forEach(function(btn) {
+          if (!__prefEnabledGallery) {
+            btn.classList.add('is-blocked');
+            btn.classList.remove('is-busy');
+            btn.disabled = true;
+            btn.title = 'Stampa disattivata nelle opzioni';
+          } else if (status === 'busy' || s.hasActiveJob) {
+            btn.classList.add('is-busy');
+            btn.classList.remove('is-blocked');
+            btn.disabled = true;
+            btn.title = 'Stampa in corso, attendi…';
+          } else if (status === 'error' || status === 'offline' || status === 'no-printer') {
+            btn.classList.add('is-blocked');
+            btn.classList.remove('is-busy');
+            btn.disabled = true;
+            btn.title = label || 'Stampante non disponibile';
+          } else if (ready) {
+            btn.classList.remove('is-blocked');
+            btn.classList.remove('is-busy');
+            btn.disabled = false;
+            btn.title = 'Stampa questa foto';
+          }
+        });
+      } catch (_) {}
+
+      // Preview popup Stampa toggle: blocca quando stampante non è pronta
+      try {
+        var stBtn = document.getElementById('ms-btn-stampa');
+        if (stBtn) {
+          var __prefEnabled = true;
+          try {
+            var __prefRaw2 = localStorage.getItem('msPanelPrintEnabled');
+            if (__prefRaw2 === '0') __prefEnabled = false;
+            if (__prefRaw2 === '1') __prefEnabled = true;
+          } catch (_) {}
+          if (!ready || !__prefEnabled) {
+            stBtn.setAttribute('data-disabled', '1');
+            stBtn.disabled = true;
+            stBtn.title = !__prefEnabled ? 'Stampa disattivata nelle opzioni' : (label || 'Stampante non disponibile');
+          } else {
+            stBtn.removeAttribute('data-disabled');
+            stBtn.disabled = false;
+            stBtn.title = '';
+          }
+        }
+      } catch (_) {}
+
+      // Live pill in pre-scatto (mostra coda stampa precedente)
+      try {
+        var lvPill = document.getElementById('ms-lv-printer-pill');
+        if (lvPill) {
+          lvPill.setAttribute('data-status', status);
+          var lvPillLbl = lvPill.querySelector('.ms-lv-pp-label');
+          if (lvPillLbl) lvPillLbl.textContent = (s.printerName ? s.printerName + ' · ' : '') + label;
+        }
+      } catch (_) {}
+
+      // Pulsante scatto in pre-scatto: SEMPRE attivo (anche se stampante busy).
+      // La stampa dall'anteprima resta bloccata finché non torna verde (gestita sopra su ms-btn-stampa).
+      try {
+        var lvShoot = document.getElementById('ms-lv-shoot');
+        if (lvShoot) {
+          lvShoot.classList.remove('is-print-busy');
+          lvShoot.removeAttribute('aria-disabled');
+          lvShoot.title = 'Scatta';
+        }
+      } catch (_) {}
+
+      __msPrinterStateListeners.forEach(function(fn) { try { fn(s); } catch (_) {} });
+    };
+
+    var __msUpdatePrinterState = window.__msUpdatePrinterState = function(next) {
+      if (!next) return;
+      __msPrinterState = next;
+      window.__msPrinterState = next;
+      __msApplyPrinterStateToUI();
+    };
+
+    var __msFetchPrinterState = window.__msFetchPrinterState = function(force) {
+      try {
+        if (!window.electronAPI || typeof window.electronAPI.getPrinterState !== 'function') return Promise.resolve(null);
+        return window.electronAPI.getPrinterState(!!force).then(function(st) {
+          if (st) __msUpdatePrinterState(st);
+          return st;
+        }).catch(function() { return null; });
+      } catch (_) { return Promise.resolve(null); }
+    };
+
+    var __msSubscribePrinterState = window.__msSubscribePrinterState = function() {
+      if (__msPrinterSubscribed) return;
+      __msPrinterSubscribed = true;
+      try {
+        if (window.electronAPI && typeof window.electronAPI.onPrinterState === 'function') {
+          window.electronAPI.onPrinterState(function(st) { if (st) __msUpdatePrinterState(st); });
+        }
+      } catch (_) {}
+      if (__msPrinterPollTimer) { try { clearInterval(__msPrinterPollTimer); } catch (_) {} }
+      __msPrinterPollTimer = setInterval(function() { __msFetchPrinterState(false); }, 3000);
+      __msFetchPrinterState(true);
+    };
+
+    var __msWirePrintCalibration = function() {
+      var card = document.getElementById('ms-c-calibration');
+      if (!card || card.dataset.msCalBound === '1') return;
+      card.dataset.msCalBound = '1';
+
+      // ── Definizione formati supportati ────────────────────────────
+      // Solo "postcard" si stampa davvero (Canon SELPHY CP1500 / KP-108).
+      // Gli altri formati sono preset visivi per anteprima/calibrazione futura.
+      // Specifiche reali Canon SELPHY CP1500 / KP-108:
+      //   - paper 100x148 mm
+      //   - stampa full-bleed (nessun margine non stampabile)
+      //   - tolleranza di taglio meccanica ~3 mm per lato (zona a rischio crop)
+      //   - safe area consigliata 94x142 mm (mantieni contenuti importanti qui)
+      var FORMATS = {
+        postcard: {
+          label: 'Postcard 10×15',
+          paper: { w: 100, h: 150 }, margin: 0, bleed: 0, safe: { w: 100, h: 150 },
+          sub: 'Postcard 100×150 mm · KP-108 (10×15)',
+          info: 'Carta: <b>100 × 150 mm</b> (10×15)<br>Stampa: <b>full-bleed</b> (nessun margine)<br>Area utile: <b>intera superficie del foglio</b>',
+          realPrint: true
+        },
+        strip: {
+          label: 'Photo Strip 5×15',
+          paper: { w: 50, h: 150 }, margin: 0, bleed: 3, safe: { w: 44, h: 144 },
+          sub: 'Photo Booth Strip 50×150 mm',
+          info: 'Carta: <b>50 × 150 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>3 mm</b> per lato<br>Safe area: <b>44 × 144 mm</b>',
+          realPrint: false
+        },
+        card: {
+          label: 'Card 54×86',
+          paper: { w: 54, h: 86 }, margin: 0, bleed: 2, safe: { w: 50, h: 82 },
+          sub: 'Card 54×86 mm',
+          info: 'Carta: <b>54 × 86 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>2 mm</b> per lato<br>Safe area: <b>50 × 82 mm</b>',
+          realPrint: false
+        },
+        square: {
+          label: 'Square 72×72',
+          paper: { w: 72, h: 72 }, margin: 0, bleed: 2, safe: { w: 68, h: 68 },
+          sub: 'Square 72×72 mm',
+          info: 'Carta: <b>72 × 72 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>2 mm</b> per lato<br>Safe area: <b>68 × 68 mm</b>',
+          realPrint: false
+        }
+      };
+
+      var inX = document.getElementById('ms-cal-x');
+      var inY = document.getElementById('ms-cal-y');
+      var inZ = document.getElementById('ms-cal-z');
+      var valX = document.getElementById('ms-cal-x-val');
+      var valY = document.getElementById('ms-cal-y-val');
+      var valZ = document.getElementById('ms-cal-z-val');
+      var btnTest = document.getElementById('ms-cal-test');
+      var btnSave = document.getElementById('ms-cal-save');
+      var btnReset = document.getElementById('ms-cal-reset');
+      var statusEl = document.getElementById('ms-cal-status');
+      var paperInfoEl = document.getElementById('ms-cal-paper-info');
+      var formatSubEl = document.getElementById('ms-cal-format-sub');
+      var coordsEl = document.getElementById('ms-cal-coords');
+      var stageEl = document.getElementById('ms-cal-stage');
+      var rulerCb = document.getElementById('ms-cal-show-ruler');
+      var coordsCb = document.getElementById('ms-cal-show-coords');
+      var zoomVal = document.getElementById('ms-cal-zoom-val');
+      var canvas = document.getElementById('ms-cal-canvas');
+      var ctx = canvas ? canvas.getContext('2d') : null;
+
+      var setStatus = function(msg) { try { if (statusEl) statusEl.textContent = msg || '—'; } catch (_) {} };
+      var clamp = function(v, min, max, fb) { var n = parseFloat(v); if (!isFinite(n)) n = fb; return Math.max(min, Math.min(max, Math.round(n * 10) / 10)); };
+
+      // ── Stato locale ──────────────────────────────────────────────
+      var currentFormat = 'postcard';
+      var previewZoom = 1.0; // 0.6 .. 1.6 (zoom anteprima — non influenza la stampa)
+
+      var presetsKey = 'ms-cal-presets-v1';
+      var loadAllPresets = function() {
+        try { return JSON.parse(localStorage.getItem(presetsKey) || '{}') || {}; } catch (_) { return {}; }
+      };
+      var saveAllPresets = function(p) {
+        try { localStorage.setItem(presetsKey, JSON.stringify(p || {})); } catch (_) {}
+      };
+      var getPreset = function(fmt) {
+        var all = loadAllPresets();
+        return all[fmt] || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100 };
+      };
+      var setPreset = function(fmt, cal) {
+        var all = loadAllPresets();
+        all[fmt] = { offsetXmm: cal.offsetXmm, offsetYmm: cal.offsetYmm, zoomPct: cal.zoomPct };
+        saveAllPresets(all);
+      };
+
+      var readUI = function() {
+        return {
+          offsetXmm: clamp(inX && inX.value, -5, 5, 0),
+          offsetYmm: clamp(inY && inY.value, -5, 5, 0),
+          zoomPct:   clamp(inZ && inZ.value, 80, 120, 100)
+        };
+      };
+      var writeUI = function(c) {
+        try {
+          c = c || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100 };
+          if (inX) inX.value = String(c.offsetXmm || 0);
+          if (inY) inY.value = String(c.offsetYmm || 0);
+          if (inZ) inZ.value = String(c.zoomPct || 100);
+          if (valX) valX.textContent = (c.offsetXmm || 0).toFixed(1) + ' mm';
+          if (valY) valY.textContent = (c.offsetYmm || 0).toFixed(1) + ' mm';
+          if (valZ) valZ.textContent = Math.round(c.zoomPct || 100) + '%';
+        } catch (_) {}
+      };
+      var refreshSliderLabels = function() {
+        var c = readUI();
+        if (valX) valX.textContent = c.offsetXmm.toFixed(1) + ' mm';
+        if (valY) valY.textContent = c.offsetYmm.toFixed(1) + ' mm';
+        if (valZ) valZ.textContent = Math.round(c.zoomPct) + '%';
+      };
+
+      // ── Sample image (foto reale per anteprima) ───────────────────
+      var sampleImg = null, sampleReady = false;
+      var loadSample = function() {
+        try {
+          var src = '';
+          // Priorita' 1: cornice attualmente selezionata in preview
+          if (!src) {
+            var fr = document.getElementById('ms-frame-ov') || document.querySelector('img[id^="ms-frame"]');
+            if (fr && fr.src) src = fr.src;
+          }
+          // Priorita' 2: ultima foto galleria (fallback)
+          if (!src && window.__msGalleryState && Array.isArray(window.__msGalleryState.items) && window.__msGalleryState.items.length) {
+            var it = window.__msGalleryState.items[0];
+            if (it && it.path) src = (typeof window.__msToLocalImageUrl === 'function') ? window.__msToLocalImageUrl(it.path) : ('file:///' + String(it.path).replace(/\\\\/g, '/'));
+          }
+          if (!src) return;
+          var im = new Image();
+          im.onload = function() { sampleImg = im; sampleReady = true; renderPreview(); };
+          im.onerror = function() { sampleReady = false; };
+          im.src = src;
+        } catch (_) {}
+      };
+
+      var drawPlaceholder = function(c, x, y, w, h) {
+        var g = c.createLinearGradient(x, y, x + w, y + h);
+        g.addColorStop(0, '#3b82f6'); g.addColorStop(1, '#8b5cf6');
+        c.fillStyle = g; c.fillRect(x, y, w, h);
+        c.fillStyle = 'rgba(255,255,255,0.85)'; c.font = 'bold 14px Arial'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillText('FOTO', x + w / 2, y + h / 2);
+      };
+
+      // Geometria stage <-> mm (per coordinate cursore)
+      var lastGeom = null;
+
+      var renderPreview = function() {
+        if (!ctx || !canvas) return;
+        var fmt = FORMATS[currentFormat] || FORMATS.postcard;
+        var cal = readUI();
+
+        // Dimensioni stage disponibili
+        var stageW = (stageEl && stageEl.clientWidth) || 600;
+        var stageH = (stageEl && stageEl.clientHeight) || 600;
+        // Padding interno per evitare di toccare i bordi dello stage
+        var availW = Math.max(120, stageW - 32);
+        var availH = Math.max(120, stageH - 32);
+
+        // Calcolo px-per-mm in modo da contenere il foglio nello stage,
+        // poi moltiplico per previewZoom per ottenere il vero rendering
+        // alla risoluzione richiesta (niente CSS transform: pixel sempre nitidi
+        // e scroll naturale dello stage quando il foglio supera l'area).
+        var ratio = fmt.paper.w / fmt.paper.h;
+        var basePxPerMm;
+        if (availW / availH > ratio) {
+          basePxPerMm = (availH / fmt.paper.h);
+        } else {
+          basePxPerMm = (availW / fmt.paper.w);
+        }
+        var pxPerMm = basePxPerMm * previewZoom;
+
+        var paperW = fmt.paper.w * pxPerMm;
+        var paperH = fmt.paper.h * pxPerMm;
+
+        // CSS size + DPR scaling per nitidezza
+        var cssW = Math.ceil(paperW + 24);
+        var cssH = Math.ceil(paperH + 24);
+        var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+        if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+          canvas.width = Math.round(cssW * dpr);
+          canvas.height = Math.round(cssH * dpr);
+          canvas.style.width = cssW + 'px';
+          canvas.style.height = cssH + 'px';
+        }
+        // Niente transform: lo zoom anteprima e' applicato direttamente nel render.
+        canvas.style.transform = 'none';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cssW, cssH);
+
+        var px = (cssW - paperW) / 2;
+        var py = (cssH - paperH) / 2;
+
+        // Foglio (paper) — bianco con angoli arrotondati e ombra
+        var radius = 8;
+        var roundRect = function(x, y, w, h, r) {
+          ctx.beginPath();
+          ctx.moveTo(x + r, y);
+          ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+          ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+          ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+          ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+          ctx.closePath();
+        };
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.45)'; ctx.shadowBlur = 18; ctx.shadowOffsetY = 6;
+        ctx.fillStyle = '#fafafa';
+        roundRect(px, py, paperW, paperH, radius);
+        ctx.fill();
+        ctx.restore();
+
+        // Aree calcolate
+        var marginPx = fmt.margin * pxPerMm;
+        var bleedPx = (fmt.bleed || 1) * pxPerMm;
+
+        // Area stampabile (paper - margini)
+        var prX = px + marginPx, prY = py + marginPx;
+        var prW = paperW - 2 * marginPx, prH = paperH - 2 * marginPx;
+
+        // Safe area (centrata, dimensioni dichiarate)
+        var safeW = (fmt.safe.w / fmt.paper.w) * paperW;
+        var safeH = (fmt.safe.h / fmt.paper.h) * paperH;
+        var safeX = px + (paperW - safeW) / 2;
+        var safeY = py + (paperH - safeH) / 2;
+
+        // Foto: zoom PROPORZIONALE (X e Y scalano insieme) + offset centrato,
+        // cosi' la proporzione della foto resta sempre la stessa.
+        // Mirror esatto di ms-direct-print.ps1 ramo full-bleed.
+        var offX = cal.offsetXmm * pxPerMm;
+        var offY = cal.offsetYmm * pxPerMm;
+        var zoom = cal.zoomPct / 100; if (zoom < 0.5) zoom = 0.5; if (zoom > 2) zoom = 2;
+        var fw = paperW * zoom;
+        var fh = paperH * zoom;
+        var fcx = px + paperW / 2 + offX;
+        var fcy = py + paperH / 2 + offY;
+        var fx = fcx - fw / 2;
+        var fy = fcy - fh / 2;
+
+        // Clip al foglio
+        ctx.save();
+        roundRect(px, py, paperW, paperH, radius);
+        ctx.clip();
+
+        if (sampleReady && sampleImg) {
+          // IDENTICO a ms-direct-print.ps1 ramo "full-bleed":
+          //   cover su pageW*zoom × pageH*zoom centrato + offset
+          var iw = sampleImg.naturalWidth, ih = sampleImg.naturalHeight;
+          var ir = iw / ih, ar = fw / fh;
+          var sx = 0, sy = 0, sw = iw, sh = ih;
+          if (ir > ar) { sw = ih * ar; sx = (iw - sw) / 2; }
+          else if (ir < ar) { sh = iw / ar; sy = (ih - sh) / 2; }
+          ctx.drawImage(sampleImg, sx, sy, sw, sh, fx, fy, fw, fh);
+        } else {
+          drawPlaceholder(ctx, fx, fy, fw, fh);
+        }
+
+        ctx.restore(); // end clip foglio
+
+        // === Overlay guida (solo outline, NON coprono mai la foto) ===
+        // Bordo foglio (paper border)
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = 1;
+        roundRect(px + 0.5, py + 0.5, paperW - 1, paperH - 1, radius);
+        ctx.stroke();
+
+        // Area stampabile: outline nero tratteggiato sottile (solo se margine > 0,
+        // altrimenti coincide col bordo carta e creerebbe confusione).
+        if (fmt.margin > 0) {
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(prX, prY, prW, prH);
+          ctx.restore();
+        }
+
+        // Safe area: outline verde alto contrasto (solo se piu' stretta del foglio).
+        if (fmt.safe.w < fmt.paper.w || fmt.safe.h < fmt.paper.h) {
+          ctx.save();
+          ctx.setLineDash([7, 4]);
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 3;
+          ctx.strokeRect(safeX, safeY, safeW, safeH);
+          ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 1.5;
+          ctx.strokeRect(safeX, safeY, safeW, safeH);
+          ctx.restore();
+        }
+
+        // Crop zone bleed: solo se bleed > 0 (altrimenti coincide col bordo carta).
+        if ((fmt.bleed || 0) > 0) {
+          ctx.save();
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 1;
+          var cropX = px + bleedPx, cropY = py + bleedPx;
+          var cropW = paperW - 2 * bleedPx, cropH = paperH - 2 * bleedPx;
+          ctx.strokeRect(cropX, cropY, cropW, cropH);
+          ctx.restore();
+        }
+
+        // Croce centrale (riferimento centro foto)
+        ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+        ctx.lineWidth = 1;
+        var ccx = px + paperW / 2 + offX, ccy = py + paperH / 2 + offY;
+        var cl = Math.max(8, 6 * pxPerMm);
+        ctx.beginPath();
+        ctx.moveTo(ccx - cl, ccy); ctx.lineTo(ccx + cl, ccy);
+        ctx.moveTo(ccx, ccy - cl); ctx.lineTo(ccx, ccy + cl);
+        ctx.stroke();
+
+        // Righelli mm (ogni 5 mm tick corti, ogni 10 mm tick lunghi + numeri)
+        if (rulerCb && rulerCb.checked) {
+          ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.lineWidth = 1;
+          ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.font = '9px Arial';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+          var tk = 2 * pxPerMm, tkBig = 3.5 * pxPerMm;
+          for (var mm = 0; mm <= fmt.paper.w; mm += 5) {
+            var xm = px + mm * pxPerMm;
+            var big = (mm % 10 === 0);
+            ctx.beginPath();
+            ctx.moveTo(xm, py); ctx.lineTo(xm, py + (big ? tkBig : tk));
+            ctx.moveTo(xm, py + paperH - (big ? tkBig : tk)); ctx.lineTo(xm, py + paperH);
+            ctx.stroke();
+            if (big && mm > 0 && mm < fmt.paper.w) {
+              ctx.fillText(String(mm), xm, py + tkBig + 2);
+            }
+          }
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          for (var mmy = 0; mmy <= fmt.paper.h; mmy += 5) {
+            var ym = py + mmy * pxPerMm;
+            var bigY = (mmy % 10 === 0);
+            ctx.beginPath();
+            ctx.moveTo(px, ym); ctx.lineTo(px + (bigY ? tkBig : tk), ym);
+            ctx.moveTo(px + paperW - (bigY ? tkBig : tk), ym); ctx.lineTo(px + paperW, ym);
+            ctx.stroke();
+            if (bigY && mmy > 0 && mmy < fmt.paper.h) {
+              ctx.fillText(String(mmy), px + tkBig + 2, ym);
+            }
+          }
+        }
+
+        // Etichetta valori in alto-sx
+        ctx.fillStyle = 'rgba(0,0,0,0.78)'; ctx.font = '11px Arial';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+        ctx.fillText(
+          fmt.label + '  ·  X ' + cal.offsetXmm + 'mm  Y ' + cal.offsetYmm + 'mm  Z ' + cal.zoomPct + '%',
+          px + 6, py + 6
+        );
+
+        lastGeom = { px: px, py: py, paperW: paperW, paperH: paperH, pxPerMm: pxPerMm, fmt: fmt };
+      };
+
+      var applyFormat = function(fmt, opts) {
+        opts = opts || {};
+        currentFormat = fmt;
+        var def = FORMATS[fmt];
+        if (formatSubEl && def) formatSubEl.textContent = def.sub;
+        if (paperInfoEl && def) paperInfoEl.innerHTML = def.info;
+        // Carica preset salvato per questo formato
+        if (fmt === 'postcard' && opts.useBackend) {
+          if (window.electronAPI && typeof window.electronAPI.getPrintCalibration === 'function') {
+            window.electronAPI.getPrintCalibration().then(function(c) {
+              writeUI(c || getPreset('postcard'));
+              setStatus('Calibrazione caricata');
+              renderPreview();
+            }).catch(function() {
+              writeUI(getPreset('postcard'));
+              setStatus('Impossibile leggere calibrazione, uso preset locale');
+              renderPreview();
+            });
+            return;
+          }
+        }
+        writeUI(getPreset(fmt));
+        if (def && !def.realPrint) setStatus('Preset visivo (stampa reale solo Postcard CP1500)');
+        else setStatus('Preset caricato');
+        renderPreview();
+      };
+
+      // ── Wiring sliders ────────────────────────────────────────────
+      [inX, inY, inZ].forEach(function(el) {
+        if (!el) return;
+        el.addEventListener('input', function() { refreshSliderLabels(); setStatus('Modifica non salvata'); renderPreview(); });
+        el.addEventListener('change', function() { refreshSliderLabels(); renderPreview(); });
+      });
+
+      // ── Wiring tabs formato ───────────────────────────────────────
+      var tabs = card.querySelectorAll('.ms-cal-tab');
+      Array.prototype.forEach.call(tabs, function(t) {
+        t.addEventListener('click', function() {
+          Array.prototype.forEach.call(tabs, function(x) { x.classList.remove('is-active'); });
+          t.classList.add('is-active');
+          var fmt = t.getAttribute('data-format') || 'postcard';
+          applyFormat(fmt, { useBackend: fmt === 'postcard' });
+        });
+      });
+
+      // ── Toggles righelli/coords ───────────────────────────────────
+      if (rulerCb) rulerCb.addEventListener('change', renderPreview);
+      if (coordsCb) coordsCb.addEventListener('change', function() {
+        if (coordsEl) coordsEl.style.display = coordsCb.checked ? '' : 'none';
+      });
+
+      // ── Zoom anteprima ────────────────────────────────────────────
+      Array.prototype.forEach.call(card.querySelectorAll('.ms-cal-zoom-btn'), function(b) {
+        b.addEventListener('click', function() {
+          var step = parseFloat(b.getAttribute('data-zoom-step') || '0');
+          previewZoom = Math.max(0.6, Math.min(1.6, previewZoom + step * 0.1));
+          if (zoomVal) zoomVal.textContent = Math.round(previewZoom * 100) + '%';
+          renderPreview();
+        });
+      });
+
+      // ── Coordinate cursore in mm ──────────────────────────────────
+      if (canvas) {
+        canvas.addEventListener('mousemove', function(e) {
+          if (!coordsEl || !coordsCb || !coordsCb.checked || !lastGeom) return;
+          var rect = canvas.getBoundingClientRect();
+          var cx = (e.clientX - rect.left) * (canvas.width / rect.width / (window.devicePixelRatio || 1));
+          var cy = (e.clientY - rect.top) * (canvas.height / rect.height / (window.devicePixelRatio || 1));
+          var mmX = (cx - lastGeom.px) / lastGeom.pxPerMm;
+          var mmY = (cy - lastGeom.py) / lastGeom.pxPerMm;
+          if (mmX < 0 || mmY < 0 || mmX > lastGeom.fmt.paper.w || mmY > lastGeom.fmt.paper.h) {
+            coordsEl.textContent = '— mm';
+          } else {
+            coordsEl.textContent = mmX.toFixed(1) + ' mm × ' + mmY.toFixed(1) + ' mm';
+          }
+        });
+        canvas.addEventListener('mouseleave', function() { if (coordsEl) coordsEl.textContent = '— mm'; });
+      }
+
+      // ── Re-render su resize/open ──────────────────────────────────
+      var ro = null;
+      try {
+        if (typeof ResizeObserver !== 'undefined' && stageEl) {
+          ro = new ResizeObserver(function() { renderPreview(); });
+          ro.observe(stageEl);
+        }
+      } catch (_) {}
+      window.addEventListener('resize', renderPreview);
+
+      // ── Salva ─────────────────────────────────────────────────────
+      if (btnSave) btnSave.addEventListener('click', function() {
+        var cal = readUI();
+        // Sempre persiste il preset locale per il formato corrente
+        setPreset(currentFormat, cal);
+        var fmtDef = FORMATS[currentFormat];
+        if (fmtDef && fmtDef.realPrint && window.electronAPI && typeof window.electronAPI.setPrintCalibration === 'function') {
+          // Solo postcard tocca la calibrazione di stampa reale (usata da galleria + post-scatto)
+          btnSave.disabled = true;
+          window.electronAPI.setPrintCalibration(cal).then(function(res) {
+            btnSave.disabled = false;
+            if (res && res.success) {
+              writeUI(res.calibration || cal);
+              setStatus('Preset salvato (applicato a stampa galleria + post-scatto)');
+              try { showToast('Calibrazione salvata', 1600, '#22c55e'); } catch (_) {}
+            } else {
+              setStatus('Errore salvataggio: ' + ((res && res.message) || 'sconosciuto'));
+            }
+          }).catch(function(e) {
+            btnSave.disabled = false;
+            setStatus('Errore: ' + (e && e.message || 'IPC'));
+          });
+        } else {
+          setStatus('Preset salvato (solo locale — formato non stampato dalla CP1500)');
+          try { showToast('Preset ' + (fmtDef && fmtDef.label || currentFormat) + ' salvato', 1600, '#22c55e'); } catch (_) {}
+        }
+      });
+
+      // ── Reset ─────────────────────────────────────────────────────
+      if (btnReset) btnReset.addEventListener('click', function() {
+        writeUI({ offsetXmm: 0, offsetYmm: 0, zoomPct: 100 });
+        setStatus('Valori resettati (non salvati)');
+        renderPreview();
+      });
+
+      // ── Stampa di test ────────────────────────────────────────────
+      if (btnTest) btnTest.addEventListener('click', function() {
+        var fmtDef = FORMATS[currentFormat];
+        if (!fmtDef || !fmtDef.realPrint) {
+          setStatus('Stampa di test disponibile solo per Postcard 10×15 (CP1500)');
+          try { showToast('Test print solo per Postcard CP1500', 2000, '#f59e0b'); } catch (_) {}
+          return;
+        }
+        if (!window.electronAPI || typeof window.electronAPI.printTestPattern !== 'function') {
+          setStatus('Stampa di test non disponibile');
+          return;
+        }
+        var cal = readUI();
+        btnTest.disabled = true;
+        setStatus('Invio stampa di test…');
+        try { if (typeof window.__msPlayUiButtonSound === 'function') window.__msPlayUiButtonSound('print'); } catch (_) {}
+        window.electronAPI.printTestPattern({ calibration: cal }).then(function(res) {
+          btnTest.disabled = false;
+          if (res && res.success) {
+            setStatus('Test inviato. Verifica allineamento sul foglio.');
+            try { showToast('Stampa di test avviata', 1800, '#22c55e'); } catch (_) {}
+          } else {
+            setStatus('Test fallito: ' + ((res && res.message) || 'errore'));
+            try { showToast('Test fallito: ' + ((res && res.message) || ''), 2400, '#ef4444'); } catch (_) {}
+          }
+        }).catch(function(e) {
+          btnTest.disabled = false;
+          setStatus('Test errore: ' + (e && e.message || 'IPC'));
+        });
+      });
+
+      // Espone refresh pubblico: utile quando l'utente cambia cornice.
+      window.__msRefreshCalibrationPreviewSample = function() {
+        try { loadSample(); } catch (_) {}
+        try { renderPreview(); } catch (_) {}
+      };
+
+      // ── Bootstrap ─────────────────────────────────────────────────
+      loadSample();
+      applyFormat('postcard', { useBackend: true });
+    };
+
+    var __msPopulatePrinterDropdown = function() {
+      var sel = document.getElementById('ms-printer-sel');
+      if (!sel || sel.dataset.msPrinterBound === '1') return;
+      sel.dataset.msPrinterBound = '1';
+      var ensureOptions = function(items, current) {
+        sel.innerHTML = '';
+        var placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Seleziona stampante…';
+        sel.appendChild(placeholder);
+        items.forEach(function(p) {
+          var opt = document.createElement('option');
+          opt.value = p.name;
+          opt.textContent = p.name + (p.isDefault ? '  ★' : '');
+          if (current && current === p.name) opt.selected = true;
+          sel.appendChild(opt);
+        });
+        if (current && !items.some(function(p) { return p.name === current; })) {
+          // Aggiunge l'opzione persistita anche se non più rilevata, per non perderla.
+          var opt2 = document.createElement('option');
+          opt2.value = current; opt2.textContent = current + '  (non rilevata)'; opt2.selected = true;
+          sel.appendChild(opt2);
+        }
+      };
+      var loadPrinters = function() {
+        if (!window.electronAPI) return;
+        var p1 = (typeof window.electronAPI.listSystemPrinters === 'function') ? window.electronAPI.listSystemPrinters() : Promise.resolve({ printers: [] });
+        var p2 = (typeof window.electronAPI.getSelectedPrinter === 'function') ? window.electronAPI.getSelectedPrinter() : Promise.resolve({ printerName: '' });
+        Promise.all([p1, p2]).then(function(res) {
+          var list = (res[0] && Array.isArray(res[0].printers)) ? res[0].printers : [];
+          var current = (res[1] && res[1].printerName) ? res[1].printerName : '';
+          ensureOptions(list, current);
+        }).catch(function() {});
+      };
+      loadPrinters();
+      sel.addEventListener('change', function() {
+        var name = String(sel.value || '').trim();
+        if (!window.electronAPI || typeof window.electronAPI.setSelectedPrinter !== 'function') return;
+        window.electronAPI.setSelectedPrinter(name).then(function(res) {
+          if (res && res.state) __msUpdatePrinterState(res.state);
+          if (name) showToast('Stampante selezionata: ' + name, 1800, '#22c55e');
+        }).catch(function() {});
+      });
+    };
+
+    var __msTriggerGalleryPrint = function(item, btn) {
+      if (!item || !window.electronAPI || typeof window.electronAPI.printImage !== 'function') {
+        showToast('Stampa non disponibile', 1800);
+        return;
+      }
+      try { if (typeof window.__msPlayUiButtonSound === 'function') window.__msPlayUiButtonSound('print'); } catch (_) {}
+      try {
+        var __prefRawGG = localStorage.getItem('msPanelPrintEnabled');
+        if (__prefRawGG === '0') {
+          showToast('Stampa disattivata nelle opzioni', 2200, '#f59e0b');
+          return;
+        }
+      } catch (_) {}
+      if (!__msIsPrinterReady()) {
+        var msg = (__msPrinterState && __msPrinterState.label) ? __msPrinterState.label : 'Stampante non disponibile';
+        showToast('Stampante occupata: ' + msg, 2200, '#facc15');
+        return;
+      }
+      // UI ottimistica: blocca subito tutti i pulsanti
+      __msPrinterState = Object.assign({}, __msPrinterState, { status: 'busy', label: 'Invio in stampa…', hasActiveJob: true, progress: 5 });
+      __msApplyPrinterStateToUI();
+      var evtToken = String(__msGalleryState.eventText || __msGetSelectedEventText() || 'evento_senza_nome').trim();
+      var __msResolvePrintTarget = function() {
+        if (item.id && window.electronAPI && typeof window.electronAPI.resolveOriginalPhotoPath === 'function') {
+          return window.electronAPI.resolveOriginalPhotoPath(evtToken, String(item.id)).then(function(r) {
+            if (r && r.success && r.path) return r.path;
+            // Fallback: lascia che main.js risolva by ID via token §
+            return evtToken + '§ID:' + String(item.id);
+          }).catch(function() {
+            return evtToken + '§ID:' + String(item.id);
+          });
+        }
+        if (item.fileName) return Promise.resolve(evtToken + '§' + String(item.fileName));
+        if (item.path) return Promise.resolve(String(item.path));
+        return Promise.resolve('');
+      };
+      __msResolvePrintTarget().then(function(filename) {
+        try { console.log('[ms] gallery print -> id=' + (item.id || '-') + ' file=' + filename); } catch (_) {}
+        if (!filename) {
+          showToast('Foto originale non trovata', 2400, '#ef4444');
+          __msFetchPrinterState(true);
+          return;
+        }
+        return window.electronAPI.printImage(filename, __msPrinterState.printerName || null, { copies: 1, paperSize: 'Paper10x15', orientation: 'Portrait' });
+      }).then(function(res) {
+        if (!res) return;
+        if (res && res.success) {
+          showToast('Stampa avviata', 1800, '#22c55e');
+        } else if (res && res.busy) {
+          showToast('Stampante occupata: attendi…', 2200, '#facc15');
+        } else {
+          showToast('Stampa fallita: ' + ((res && res.message) || 'errore sconosciuto'), 2600, '#ef4444');
+        }
+        __msFetchPrinterState(true);
+      }).catch(function(err) {
+        showToast('Errore stampa: ' + (err && err.message ? err.message : 'sconosciuto'), 2600, '#ef4444');
+        __msFetchPrinterState(true);
+      });
+    };
+    window.__msTriggerGalleryPrint = __msTriggerGalleryPrint;
+
+    var __msGetSelectedEventText = function() {
+      try {
+        var evtSel = document.getElementById('ms-evt-sel');
+        if (evtSel && evtSel.selectedIndex >= 0 && evtSel.options && evtSel.options[evtSel.selectedIndex]) {
+          var t = String(evtSel.options[evtSel.selectedIndex].text || evtSel.options[evtSel.selectedIndex].textContent || '').trim();
+          if (t) return t;
+        }
+      } catch (_) {}
+      try {
+        var ls = String(localStorage.getItem(MS_LAST_EVT_KEY) || '').trim();
+        if (ls) return ls;
+      } catch (_) {}
+      return 'evento_senza_nome';
+    };
+
+    var __msToLocalImageUrl = function(absPath) {
+      var normalized = String(absPath || '').split(String.fromCharCode(92)).join('/');
+      return 'mslocal://localhost/' + encodeURIComponent(normalized);
+    };
+
+    var __msLoadEventPhotos = function(eventText) {
+      return new Promise(function(resolve) {
+        try {
+          if (!window.electronAPI || typeof window.electronAPI.getEventPhotos !== 'function') {
+            resolve({ success: false, photos: [], nextIdText: '0001' });
+            return;
+          }
+          window.electronAPI.getEventPhotos(eventText).then(function(res) {
+            resolve(res || { success: false, photos: [], nextIdText: '0001' });
+          }).catch(function() {
+            resolve({ success: false, photos: [], nextIdText: '0001' });
+          });
+        } catch (_) {
+          resolve({ success: false, photos: [], nextIdText: '0001' });
+        }
+      });
+    };
+
+    var __msSetPreviewIdText = function(nextIdText) {
+      var txt = 'ID ' + String(nextIdText || '0001').padStart(4, '0');
+      window.__msCurrentPreviewIdText = txt;
+      var wm = document.getElementById('ms-id-watermark');
+      if (wm) wm.textContent = txt;
+      var pv = document.getElementById('ms-preview-id-watermark');
+      if (pv) pv.textContent = txt;
+    };
+
+    var __msPad2 = function(v) {
+      var n = Number(v) || 0;
+      return String(n).padStart(2, '0');
+    };
+
+    var __msFmtHm = function(ts) {
+      var d = new Date(Number(ts) || 0);
+      return __msPad2(d.getHours()) + ':' + __msPad2(d.getMinutes());
+    };
+
+    var __msBuildGalleryGroups = function(items) {
+      var arr = Array.isArray(items) ? items : [];
+      var slotMinutes = Math.max(10, Number(__msGalleryState.slotMinutes) || 30);
+      var slotMs = slotMinutes * 60 * 1000;
+      var cacheKey = String(slotMinutes) + '|' + arr.map(function(it) {
+        return String(it && it.fileName || '') + ':' + String(it && it.mtimeMs || 0);
+      }).join('|');
+      if (cacheKey === __msGalleryState._groupCacheKey) {
+        return __msGalleryState._groupCache;
+      }
+
+      var map = Object.create(null);
+      arr.forEach(function(item, idx) {
+        var rawTs = Number(item && item.mtimeMs) || 0;
+        var ts = rawTs > 0 ? rawTs : (Date.now() - (idx * 1000));
+        var startMs = Math.floor(ts / slotMs) * slotMs;
+        var key = String(startMs);
+        if (!map[key]) {
+          map[key] = {
+            key: key,
+            startMs: startMs,
+            endMs: startMs + slotMs,
+            label: __msFmtHm(startMs) + ' - ' + __msFmtHm(startMs + slotMs),
+            items: []
+          };
+        }
+        map[key].items.push({ item: item, index: idx, ts: ts });
+      });
+
+      var groups = Object.keys(map).map(function(k) { return map[k]; }).sort(function(a, b) {
+        return (b.startMs || 0) - (a.startMs || 0);
+      });
+      groups.forEach(function(g) {
+        g.items.sort(function(a, b) {
+          if ((b.ts || 0) !== (a.ts || 0)) return (b.ts || 0) - (a.ts || 0);
+          return (b.index || 0) - (a.index || 0);
+        });
+      });
+
+      __msGalleryState._groupCacheKey = cacheKey;
+      __msGalleryState._groupCache = groups;
+      return groups;
+    };
+
+    var __msSetSelectedGalleryIndex = function(index, card) {
+      __msGalleryState.index = index;
+      var host = document.getElementById('ms-gallery-grid');
+      if (!host) return;
+      Array.from(host.querySelectorAll('.ms-g-item.sel')).forEach(function(el) { el.classList.remove('sel'); });
+      if (card) card.classList.add('sel');
+    };
+
+    var __msDisconnectGalleryObserver = function() {
+      if (__msGalleryObserver) {
+        try { __msGalleryObserver.disconnect(); } catch (_) {}
+      }
+      __msGalleryObserver = null;
+    };
+
+    var __msPrimeGalleryLazyAssets = function(scopeRoot) {
+      var root = scopeRoot || document;
+      var lazyImgs = Array.from(root.querySelectorAll('img[data-ms-src], .ms-g-bg[data-ms-bg]'));
+      if (!lazyImgs.length) return;
+
+      var hydrate = function(el) {
+        if (!el) return;
+        if (el.tagName === 'IMG') {
+          var src = el.getAttribute('data-ms-src');
+          if (src && !el.getAttribute('src')) el.setAttribute('src', src);
+          el.removeAttribute('data-ms-src');
+          return;
+        }
+        var bg = el.getAttribute('data-ms-bg');
+        if (bg) el.style.backgroundImage = 'url("' + bg.replace(/"/g, '%22') + '")';
+        el.removeAttribute('data-ms-bg');
+      };
+
+      if (typeof IntersectionObserver !== 'function') {
+        lazyImgs.forEach(hydrate);
+        return;
+      }
+
+      __msDisconnectGalleryObserver();
+      __msGalleryObserver = new IntersectionObserver(function(entries, obs) {
+        entries.forEach(function(entry) {
+          if (!entry.isIntersecting) return;
+          hydrate(entry.target);
+          obs.unobserve(entry.target);
+        });
+      }, { root: document.getElementById('ms-gallery-grid'), threshold: 0.12, rootMargin: '120px 0px 120px 0px' });
+
+      lazyImgs.forEach(function(el) { __msGalleryObserver.observe(el); });
+    };
+
+    var __msRenderGalleryChips = function(groups) {
+      var chips = document.getElementById('ms-gallery-chips');
+      if (!chips) return;
+      chips.innerHTML = '';
+      var arr = Array.isArray(groups) ? groups : [];
+      if (!arr.length) return;
+      arr.forEach(function(group) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ms-g-chip';
+        btn.textContent = __msFmtHm(group.startMs) + ' · ' + String(group.items.length);
+        btn.setAttribute('data-target', 'ms-g-sec-' + String(group.key));
+        btn.addEventListener('click', function() {
+          var target = document.getElementById('ms-g-sec-' + String(group.key));
+          if (target && typeof target.scrollIntoView === 'function') {
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        });
+        chips.appendChild(btn);
+      });
+    };
+
+    var __msRefreshPreviewIdWatermark = function() {
+      var evtTxt = __msGetSelectedEventText();
+      __msLoadEventPhotos(evtTxt).then(function(res) {
+        var nextIdText = (res && res.nextIdText) ? String(res.nextIdText) : '0001';
+        __msSetPreviewIdText(nextIdText);
+      });
+    };
+    window.__msRefreshPreviewIdWatermark = __msRefreshPreviewIdWatermark;
+
+    var __msRenderGallery = function() {
+      var grid = document.getElementById('ms-gallery-grid');
+      var empty = document.getElementById('ms-gallery-empty');
+      var count = document.getElementById('ms-gallery-count');
+      var chips = document.getElementById('ms-gallery-chips');
+      if (!grid || !empty || !count) return;
+
+      __msDisconnectGalleryObserver();
+
+      var total = __msGalleryState.items.length;
+      if (!total) {
+        grid.innerHTML = '';
+        if (chips) chips.innerHTML = '';
+        empty.style.display = 'block';
+        count.textContent = '0 foto · 0 fasce orarie';
+        return;
+      }
+
+      var groups = __msBuildGalleryGroups(__msGalleryState.items);
+      __msGalleryState.groups = groups;
+      empty.style.display = 'none';
+      count.textContent = String(total) + ' foto · ' + String(groups.length) + ' fasce orarie';
+      __msRenderGalleryChips(groups);
+
+      grid.innerHTML = '';
+      var eagerBudget = 12;
+      groups.forEach(function(group) {
+        var section = document.createElement('section');
+        section.className = 'ms-g-section';
+        section.id = 'ms-g-sec-' + String(group.key);
+
+        var head = document.createElement('div');
+        head.className = 'ms-g-section-head';
+
+        var tWrap = document.createElement('div');
+        var title = document.createElement('div');
+        title.className = 'ms-g-section-title';
+        title.textContent = '🕒 ' + String(group.label);
+        var sub = document.createElement('div');
+        sub.className = 'ms-g-section-sub';
+        sub.textContent = String(group.items.length) + ' foto';
+        var line = document.createElement('div');
+        line.className = 'ms-g-section-line';
+        tWrap.appendChild(title);
+        tWrap.appendChild(sub);
+        tWrap.appendChild(line);
+        head.appendChild(tWrap);
+
+        var row = document.createElement('div');
+        row.className = 'ms-g-row';
+
+        group.items.forEach(function(entry, rowIdx) {
+          var item = entry.item;
+          var idx = entry.index;
+          var card = document.createElement('div');
+          card.className = 'ms-g-item';
+          card.setAttribute('data-index', String(idx));
+          if (idx === __msGalleryState.index) card.classList.add('sel');
+
+          var mediaWrap = document.createElement('div');
+          mediaWrap.className = 'ms-g-media';
+
+          var bg = document.createElement('div');
+          bg.className = 'ms-g-bg';
+
+          var im = document.createElement('img');
+          im.className = 'ms-g-photo';
+          im.alt = item.fileName || ('foto_' + (idx + 1));
+          im.loading = 'lazy';
+          im.decoding = 'async';
+
+          var localUrl = __msToLocalImageUrl(item.path);
+          if (eagerBudget > 0 || rowIdx < 2) {
+            bg.style.backgroundImage = 'url("' + localUrl.replace(/"/g, '%22') + '")';
+            im.src = localUrl;
+            eagerBudget--;
+          } else {
+            bg.setAttribute('data-ms-bg', localUrl);
+            im.setAttribute('data-ms-src', localUrl);
+          }
+
+          var idBadge = document.createElement('div');
+          idBadge.className = 'ms-g-id';
+          idBadge.textContent = 'ID ' + String(item.id || '----');
+
+          var actions = document.createElement('div');
+          actions.className = 'ms-g-actions';
+
+          var openBtn = document.createElement('button');
+          openBtn.type = 'button';
+          openBtn.className = 'ms-g-btn open';
+          openBtn.textContent = 'Stampa';
+          openBtn.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            __msTriggerGalleryPrint(item, openBtn);
+          });
+
+          var delBtn = document.createElement('button');
+          delBtn.type = 'button';
+          delBtn.className = 'ms-g-btn del';
+          delBtn.textContent = 'Elimina';
+          delBtn.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            __msDeleteGalleryPhoto(idx);
+          });
+
+          actions.appendChild(openBtn);
+          actions.appendChild(delBtn);
+          mediaWrap.appendChild(bg);
+          mediaWrap.appendChild(im);
+          card.appendChild(mediaWrap);
+          card.appendChild(idBadge);
+          card.appendChild(actions);
+          card.addEventListener('mouseenter', function() {
+            __msSetSelectedGalleryIndex(idx, card);
+          });
+          card.addEventListener('pointerdown', function() {
+            __msSetSelectedGalleryIndex(idx, card);
+          });
+          card.addEventListener('click', function() {
+            __msSetSelectedGalleryIndex(idx, card);
+            __msOpenGalleryViewer(idx);
+          });
+          row.appendChild(card);
+        });
+
+        section.appendChild(head);
+        section.appendChild(row);
+        grid.appendChild(section);
+      });
+
+      __msPrimeGalleryLazyAssets(grid);
+      try { __msApplyPrinterStateToUI(); } catch (_) {}
+    };
+
+    var __msRenderGalleryViewer = function() {
+      var modal = document.getElementById('ms-gallery-viewer-modal');
+      var media = document.getElementById('ms-gallery-viewer-media');
+      var meta = document.getElementById('ms-gallery-viewer-meta');
+      if (!modal || !media || !meta) return;
+      var total = __msGalleryState.items.length;
+      if (!total) {
+        modal.style.display = 'none';
+        return;
+      }
+      if (__msGalleryState.index < 0) __msGalleryState.index = 0;
+      if (__msGalleryState.index >= total) __msGalleryState.index = total - 1;
+      var current = __msGalleryState.items[__msGalleryState.index];
+      media.src = __msToLocalImageUrl(current.path);
+      meta.textContent = 'ID ' + String(current.id || '----') + ' · ' + String(current.fileName || 'foto') + ' · ' + String(__msGalleryState.index + 1) + '/' + String(total);
+    };
+
+    var __msOpenGalleryViewer = function(index) {
+      var modal = document.getElementById('ms-gallery-viewer-modal');
+      if (!modal) return;
+      if (typeof index === 'number') __msGalleryState.index = index;
+      __msRenderGalleryViewer();
+      modal.style.display = 'flex';
+    };
+
+    var __msCloseGalleryViewer = function() {
+      var modal = document.getElementById('ms-gallery-viewer-modal');
+      if (modal) modal.style.display = 'none';
+    };
+
+    var __msDeleteGalleryPhoto = function(index) {
+      if (!window.electronAPI || typeof window.electronAPI.deletePhoto !== 'function') {
+        showToast('Eliminazione non disponibile', 2200);
+        return;
+      }
+      var item = __msGalleryState.items[index];
+      if (!item || !item.fileName) return;
+      var token = String(__msGalleryState.eventText || __msGetSelectedEventText() || 'evento_senza_nome') + '§' + String(item.fileName);
+      window.electronAPI.deletePhoto(token).then(function(res) {
+        if (!res || !res.success) {
+          showToast('Errore eliminazione foto', 2500);
+          return;
+        }
+        __msLoadEventPhotos(__msGalleryState.eventText || __msGetSelectedEventText()).then(function(newRes) {
+          __msGalleryState.items = (newRes && Array.isArray(newRes.photos)) ? newRes.photos : [];
+          if (__msGalleryState.index >= __msGalleryState.items.length) __msGalleryState.index = Math.max(0, __msGalleryState.items.length - 1);
+          __msRenderGallery();
+          __msRenderGalleryViewer();
+          __msRefreshPreviewIdWatermark();
+          showToast('Foto eliminata', 1800, '#22c55e');
+        });
+      }).catch(function() {
+        showToast('Errore eliminazione foto', 2500);
+      });
+    };
+
+    var __msOpenGallery = function() {
+      var modal = document.getElementById('ms-gallery-modal');
+      var title = document.getElementById('ms-gallery-title');
+      var subtitle = document.getElementById('ms-gallery-subtitle');
+      var chips = document.getElementById('ms-gallery-chips');
+      if (!modal) return;
+      var evtTxt = __msGetSelectedEventText();
+      if (!evtTxt || evtTxt === 'evento_senza_nome') {
+        showToast('Seleziona un evento per aprire la galleria', 2200);
+        return;
+      }
+      if (title) title.textContent = 'Galleria evento · ' + evtTxt;
+      if (subtitle) subtitle.textContent = 'Timeline smart · fasce da 30 minuti';
+      modal.style.display = 'flex';
+      requestAnimationFrame(function() { modal.classList.add('show'); });
+      var skelGrid = document.getElementById('ms-gallery-grid');
+      var skelEmpty = document.getElementById('ms-gallery-empty');
+      var skelCount = document.getElementById('ms-gallery-count');
+      if (chips) chips.innerHTML = '';
+      if (skelGrid) {
+        skelGrid.innerHTML = '';
+        for (var si = 0; si < 3; si++) {
+          var skSec = document.createElement('section');
+          skSec.className = 'ms-g-section';
+          var skHead = document.createElement('div');
+          skHead.className = 'ms-g-section-head';
+          skHead.textContent = '🕒 --:-- - --:--';
+          var skRow = document.createElement('div');
+          skRow.className = 'ms-g-row';
+          for (var sj = 0; sj < 4; sj++) {
+            var sk = document.createElement('div');
+            sk.className = 'ms-g-item ms-g-skel-card';
+            skRow.appendChild(sk);
+          }
+          skSec.appendChild(skHead);
+          skSec.appendChild(skRow);
+          skelGrid.appendChild(skSec);
+        }
+      }
+      if (skelEmpty) skelEmpty.style.display = 'none';
+      if (skelCount) skelCount.textContent = 'Caricamento timeline…';
+      __msLoadEventPhotos(evtTxt).then(function(res) {
+        __msGalleryState.items = (res && Array.isArray(res.photos)) ? res.photos : [];
+        __msGalleryState.index = 0;
+        __msGalleryState.eventText = evtTxt;
+        __msGalleryState._groupCacheKey = '';
+        __msRenderGallery();
+      });
+    };
+
+    var __msCloseGallery = function() {
+      var modal = document.getElementById('ms-gallery-modal');
+      if (!modal) return;
+      __msDisconnectGalleryObserver();
+      modal.classList.remove('show');
+      setTimeout(function() {
+        if (!modal.classList.contains('show')) modal.style.display = 'none';
+      }, 250);
+    };
+
     // â”€â”€ FRAMES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     var MS_LOCAL_FRAMES_KEY = 'msLocalFramesV1';
     var MS_SELECTED_FRAME_KEY = 'msSelectedFrameV1';
@@ -3420,7 +6879,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         sessFrameOv = document.createElement('img');
         sessFrameOv.id = 'ms-session-frame-ov';
         sessFrameOv.alt = '';
-        sessFrameOv.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:fill;z-index:2147483000;pointer-events:none;display:none;';
+        sessFrameOv.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;object-fit:fill;z-index:2147483000;pointer-events:none;display:none;';
         (document.documentElement || document.body).appendChild(sessFrameOv);
       }
       var selectedName = getSelectedFrameName();
@@ -3477,9 +6936,22 @@ function injectRemoteUiRedesign(win, targetFrame) {
         sessionLikelyActive = false;
       }
       if (sessionLikelyActive && source) {
+        // Evita doppia cornice: in sessione live la cornice "lite" e' quella attiva.
+        // Manteniamo questo overlay allineato come src, ma invisibile quando la lite e' visibile.
+        var liteOv = document.getElementById('ms-session-frame-ov-lite');
+        var liteActive = false;
+        try {
+          liteActive = !!(liteOv && window.getComputedStyle(liteOv).display !== 'none');
+        } catch (_) {}
+
         if (sessFrameOv.src !== source) sessFrameOv.src = source;
+        if (liteActive) {
+          if (sessFrameOv.style.display !== 'none') sessFrameOv.style.display = 'none';
+          return;
+        }
+
         if (sessFrameOv.style.display !== 'block') {
-          sessFrameOv.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:fill;z-index:2147483000;pointer-events:none;display:block;';
+          sessFrameOv.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;object-fit:fill;z-index:2147483000;pointer-events:none;display:block;';
         }
         // Riappende solo se non e' gia' figlio della root, per evitare loop con MutationObserver.
         var rootEl = document.documentElement || document.body;
@@ -3538,6 +7010,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           setSelectedFrameName(fileName);
           var ov = document.getElementById('ms-frame-ov');
           if (ov) { ov.src = fileUrl; ov.style.display = 'block'; }
+          try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
           syncSessionFrameOverlay();
         });
         del.addEventListener('click', function(e) {
@@ -3555,12 +7028,14 @@ function injectRemoteUiRedesign(win, targetFrame) {
             ov.src = '';
           }
           renderLocalFrames();
+          try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
           syncSessionFrameOverlay();
         });
         if ((selectedName && fileName === selectedName) || (!selectedName && idx === 0 && !grid.querySelector('.ms-fi.sel'))) {
           item.classList.add('sel');
           var ov0 = document.getElementById('ms-frame-ov');
           if (ov0) { ov0.src = fileUrl; ov0.style.display = 'block'; }
+          try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
         }
       });
       if (!window._msLocalFrames.length) {
@@ -3606,16 +7081,31 @@ function injectRemoteUiRedesign(win, targetFrame) {
         var canvas = document.createElement('canvas');
         canvas.width = SELPHY_W; canvas.height = SELPHY_H;
         var ctx2 = canvas.getContext('2d');
-        // Cover fit: scala mantenendo le proporzioni e taglia al centro
-        var srcR = img.naturalWidth / img.naturalHeight;
-        var dstR = SELPHY_W / SELPHY_H;
-        var sx = 0, sy = 0, sw = img.naturalWidth, sh = img.naturalHeight;
-        if (srcR > dstR) { sw = img.naturalHeight * dstR; sx = (img.naturalWidth - sw) / 2; }
-        else if (srcR < dstR) { sh = img.naturalWidth / dstR; sy = (img.naturalHeight - sh) / 2; }
-        ctx2.drawImage(img, sx, sy, sw, sh, 0, 0, SELPHY_W, SELPHY_H);
+        if (!ctx2) {
+          callback(null, true);
+          return;
+        }
+        // Contain fit: preserva tutta la grafica della cornice, senza tagli.
+        // Se il rapporto non e' 2:3, aggiunge margini trasparenti.
+        var srcW = img.naturalWidth || img.width || SELPHY_W;
+        var srcH = img.naturalHeight || img.height || SELPHY_H;
+        var scale = Math.min(SELPHY_W / srcW, SELPHY_H / srcH);
+        var drawW = Math.round(srcW * scale);
+        var drawH = Math.round(srcH * scale);
+        var dx = Math.round((SELPHY_W - drawW) / 2);
+        var dy = Math.round((SELPHY_H - drawH) / 2);
+        ctx2.clearRect(0, 0, SELPHY_W, SELPHY_H);
+        ctx2.imageSmoothingEnabled = true;
+        ctx2.imageSmoothingQuality = 'high';
+        ctx2.drawImage(img, 0, 0, srcW, srcH, dx, dy, drawW, drawH);
         canvas.toBlob(function(blob) {
           if (!blob) {
-            callback(null, true);
+            try {
+              var fallbackDataUrl = canvas.toDataURL('image/png');
+              callback(fallbackDataUrl || null, !fallbackDataUrl);
+            } catch (_) {
+              callback(null, true);
+            }
             return;
           }
           var reader = new FileReader();
@@ -3715,6 +7205,351 @@ function injectRemoteUiRedesign(win, targetFrame) {
       bindToggle('ms-t-print', findOrigCheckbox('stamp'));
       bindTiming('ms-s-countdown', findOrigTimingEl('scatt'));
       bindTiming('ms-s-inactivity', findOrigTimingEl('inattiv'));
+      __msPopulatePrinterDropdown();
+      __msWirePrintCalibration();
+      __msSubscribePrinterState();
+      bindBtn('ms-gallery-btn', function() { __msOpenGallery(); });
+      bindBtn('ms-gallery-btn-top', function() { __msOpenGallery(); });
+      bindBtn('ms-start-btn-top', function() {
+        var b = document.getElementById('ms-start-btn');
+        if (b) { try { b.click(); } catch (_) {} }
+      });
+
+      // ── F2: posiziona START MIRROR come CTA sotto la preview ─────
+      // Lo spostiamo da dentro #ms-preview-inner a #ms-preview-wrap,
+      // come ultimo figlio, cosi' il flex column lo mette sotto e
+      // centrato. Idempotente.
+      (function() {
+        try {
+          var btn = document.getElementById('ms-start-btn');
+          var wrap = document.getElementById('ms-preview-wrap');
+          if (btn && wrap && btn.parentElement !== wrap) {
+            wrap.appendChild(btn);
+          }
+        } catch (_) {}
+      })();
+
+      // ── F2.1: Sposta la card "Cornici" sotto START come strip orizzontale ──
+      (function() {
+        try {
+          var wrap = document.getElementById('ms-preview-wrap');
+          var framesCard = document.getElementById('ms-c-frames');
+          if (!wrap || !framesCard) return;
+          // Crea section wrapper (idempotente)
+          var section = document.getElementById('ms-frames-section');
+          if (!section) {
+            section = document.createElement('div');
+            section.id = 'ms-frames-section';
+            // Header con titolo + bottone aggiungi (proxy verso input file esistente)
+            var head = document.createElement('div');
+            head.className = 'ms-frames-head';
+            head.innerHTML =
+              '<div class="ms-frames-title">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 7h10v10H7z"/></svg>' +
+                '<span>Cornici</span>' +
+              '</div>' +
+              '<button type="button" class="ms-frames-add" id="ms-frames-add-proxy">' +
+                '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
+                '<span>Aggiungi</span>' +
+              '</button>';
+            section.appendChild(head);
+          }
+          // Sposta la card cornici dentro la section (sotto l'header)
+          if (framesCard.parentElement !== section) {
+            section.appendChild(framesCard);
+          }
+          framesCard.classList.add('ms-frames-strip');
+          // Inserisci la section dopo #ms-start-btn (oppure in fondo a wrap)
+          if (section.parentElement !== wrap) {
+            wrap.appendChild(section);
+          }
+          // Wiring proxy del bottone Aggiungi -> click sull'input file esistente
+          var proxyBtn = document.getElementById('ms-frames-add-proxy');
+          if (proxyBtn && !proxyBtn.dataset.bound) {
+            proxyBtn.dataset.bound = '1';
+            proxyBtn.addEventListener('click', function() {
+              var inp = document.getElementById('ms-frame-file-input');
+              if (inp) inp.click();
+            });
+          }
+        } catch (e) {
+          try { console.warn('[ms] frames-section relocate failed:', e.message); } catch(_) {}
+        }
+      })();
+
+      // ── F2.1: Quick actions Galleria + Calibrazione in cima al panel ──
+      (function() {
+        try {
+          var panel = document.getElementById('ms-panel');
+          if (!panel) return;
+          if (document.getElementById('ms-panel-actions')) return; // idempotente
+          var bar = document.createElement('div');
+          bar.id = 'ms-panel-actions';
+          bar.className = 'ms-panel-actions';
+          bar.innerHTML =
+            '<button type="button" class="ms-pa-btn" id="ms-pa-gallery">' +
+              '<span class="ms-pa-ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>' +
+              '<span>Galleria</span>' +
+            '</button>' +
+            '<button type="button" class="ms-pa-btn" id="ms-pa-calibration">' +
+              '<span class="ms-pa-ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg></span>' +
+              '<span>Calibrazione</span>' +
+            '</button>';
+          panel.insertBefore(bar, panel.firstChild);
+          var gBtn = document.getElementById('ms-pa-gallery');
+          if (gBtn) gBtn.addEventListener('click', function() { try { __msOpenGallery(); } catch(_){} });
+          var cBtn = document.getElementById('ms-pa-calibration');
+          if (cBtn) cBtn.addEventListener('click', function() {
+            if (typeof window.__msOpenCalibration === 'function') window.__msOpenCalibration();
+            else {
+              var legacy = document.getElementById('ms-calibration-btn-top');
+              if (legacy) try { legacy.click(); } catch(_){}
+            }
+          });
+        } catch (_) {}
+      })();
+
+      // ── F2.1: Aggiungi icone ai titoli delle card del panel ─────
+      (function() {
+        try {
+          var icons = {
+            'ms-c-dev':     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>',
+            'ms-c-evt':     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+            'ms-c-save':    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+            'ms-c-pth':     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+            'ms-c-opts':    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+            'ms-c-timing':  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+            'ms-c-frames':  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 7h10v10H7z"/></svg>'
+          };
+          Object.keys(icons).forEach(function(cardId) {
+            var card = document.getElementById(cardId);
+            if (!card) return;
+            var ct = card.querySelector(':scope > .ms-ct');
+            if (!ct) return;
+            // Trova il primo span "title" — se non c'è, wrappa il primo nodo testo
+            var firstSpan = ct.querySelector('span');
+            if (!firstSpan) {
+              firstSpan = document.createElement('span');
+              firstSpan.textContent = ct.textContent.trim();
+              ct.textContent = '';
+              ct.appendChild(firstSpan);
+            }
+            if (!firstSpan.querySelector('.ms-ct-ic')) {
+              var icSpan = document.createElement('span');
+              icSpan.className = 'ms-ct-ic';
+              icSpan.innerHTML = icons[cardId];
+              firstSpan.insertBefore(icSpan, firstSpan.firstChild);
+            }
+          });
+        } catch (_) {}
+      })();
+
+      // ── F1: Impostazioni (drawer laterale) ──────────────────────
+      var __msOpenSettings = function() {
+        var btn = document.getElementById('ms-settings-btn');
+        var dw = document.getElementById('ms-settings-drawer');
+        var bk = document.getElementById('ms-settings-backdrop');
+        if (dw) { dw.classList.add('is-open'); dw.setAttribute('aria-hidden', 'false'); }
+        if (bk) { bk.classList.add('is-open'); bk.setAttribute('aria-hidden', 'false'); }
+        if (btn) btn.classList.add('is-active');
+      };
+      var __msCloseSettings = function() {
+        var btn = document.getElementById('ms-settings-btn');
+        var dw = document.getElementById('ms-settings-drawer');
+        var bk = document.getElementById('ms-settings-backdrop');
+        if (dw) { dw.classList.remove('is-open'); dw.setAttribute('aria-hidden', 'true'); }
+        if (bk) { bk.classList.remove('is-open'); bk.setAttribute('aria-hidden', 'true'); }
+        if (btn) btn.classList.remove('is-active');
+      };
+      window.__msOpenSettings = __msOpenSettings;
+      window.__msCloseSettings = __msCloseSettings;
+
+      bindBtn('ms-settings-btn', function() {
+        var dw = document.getElementById('ms-settings-drawer');
+        if (dw && dw.classList.contains('is-open')) __msCloseSettings();
+        else __msOpenSettings();
+      });
+      bindBtn('ms-settings-close', function() { __msCloseSettings(); });
+      (function() {
+        var bk = document.getElementById('ms-settings-backdrop');
+        if (bk && !bk.dataset.bound) {
+          bk.dataset.bound = '1';
+          bk.addEventListener('click', function() { __msCloseSettings(); });
+        }
+        // ESC chiude
+        if (!window.__msSettingsEscBound) {
+          window.__msSettingsEscBound = true;
+          document.addEventListener('keydown', function(ev) {
+            if (ev.key === 'Escape') {
+              var dw = document.getElementById('ms-settings-drawer');
+              if (dw && dw.classList.contains('is-open')) { __msCloseSettings(); }
+            }
+          });
+        }
+      })();
+
+      // Highlight di una card del pannello (animazione "salta all'occhio")
+      var __msFlashCard = function(cardId) {
+        var c = document.getElementById(cardId);
+        if (!c) return;
+        try { c.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
+        c.classList.remove('ms-sd-target');
+        // forza reflow per ri-triggerare l'animazione
+        void c.offsetWidth;
+        c.classList.add('ms-sd-target');
+        setTimeout(function() {
+          if (c) c.classList.remove('ms-sd-target');
+        }, 1600);
+        // focus intelligente sul primo input/select/button della card
+        try {
+          var f = c.querySelector('select, input, button');
+          if (f) f.focus({ preventScroll: true });
+        } catch (_) {}
+      };
+
+      // Apertura modal calibrazione anche da contesti esterni al bottone topbar.
+      var __msOpenCalibration = function() {
+        var card = document.getElementById('ms-c-calibration');
+        var backdrop = document.getElementById('ms-calibration-backdrop');
+        if (!card) return;
+        card.classList.add('ms-open');
+        if (backdrop) backdrop.style.display = 'block';
+        var legacy = document.getElementById('ms-calibration-btn-top');
+        if (legacy) legacy.classList.add('is-active');
+        setTimeout(function() {
+          try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+        }, 30);
+      };
+      window.__msOpenCalibration = __msOpenCalibration;
+
+      // Wiring delle voci del drawer (delegated)
+      (function() {
+        var drawer = document.getElementById('ms-settings-drawer');
+        if (!drawer || drawer.dataset.bound) return;
+        drawer.dataset.bound = '1';
+        drawer.addEventListener('click', function(ev) {
+          var t = ev.target && ev.target.closest ? ev.target.closest('.ms-sd-item') : null;
+          if (!t) return;
+          var action = t.getAttribute('data-action');
+          // Chiudi il drawer prima di aprire altri overlay (evita z-index conflicts)
+          __msCloseSettings();
+          // Piccolo delay per far percepire la transizione
+          setTimeout(function() {
+            switch (action) {
+              case 'gallery':
+                try { __msOpenGallery(); } catch (_) {}
+                break;
+              case 'calibration':
+                __msOpenCalibration();
+                break;
+              case 'printer':
+                __msFlashCard('ms-c-opts');
+                break;
+              case 'sounds':
+                __msFlashCard('ms-c-opts');
+                break;
+              case 'timing':
+                __msFlashCard('ms-c-timing');
+                break;
+              case 'folder':
+                __msFlashCard('ms-c-pth');
+                break;
+              case 'advanced':
+                __msFlashCard('ms-c-opts');
+                break;
+            }
+          }, 220);
+        });
+      })();
+      bindBtn('ms-calibration-btn-top', function() {
+        var card = document.getElementById('ms-c-calibration');
+        var btn = document.getElementById('ms-calibration-btn-top');
+        var backdrop = document.getElementById('ms-calibration-backdrop');
+        if (!card) return;
+        var willOpen = !card.classList.contains('ms-open');
+        if (willOpen) card.classList.add('ms-open');
+        else card.classList.remove('ms-open');
+        if (backdrop) backdrop.style.display = willOpen ? 'block' : 'none';
+        if (btn) {
+          if (willOpen) btn.classList.add('is-active');
+          else btn.classList.remove('is-active');
+        }
+        // Forza un resize event così il canvas calibrazione si ridimensiona allo stage appena visibile
+        if (willOpen) {
+          setTimeout(function() {
+            try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+          }, 30);
+        }
+      });
+      bindBtn('ms-calibration-close', function() {
+        var card = document.getElementById('ms-c-calibration');
+        var btn = document.getElementById('ms-calibration-btn-top');
+        var backdrop = document.getElementById('ms-calibration-backdrop');
+        if (card) card.classList.remove('ms-open');
+        if (btn) btn.classList.remove('is-active');
+        if (backdrop) backdrop.style.display = 'none';
+      });
+      (function() {
+        var backdrop = document.getElementById('ms-calibration-backdrop');
+        if (backdrop && !backdrop.dataset.bound) {
+          backdrop.dataset.bound = '1';
+          backdrop.addEventListener('click', function() {
+            var card = document.getElementById('ms-c-calibration');
+            var btn = document.getElementById('ms-calibration-btn-top');
+            if (card) card.classList.remove('ms-open');
+            if (btn) btn.classList.remove('is-active');
+            backdrop.style.display = 'none';
+          });
+        }
+      })();
+      bindBtn('ms-gallery-close', function() { __msCloseGallery(); });
+      bindBtn('ms-gallery-download-all', function() {
+        if (!__msGalleryState.items.length) { showToast('Nessuna foto da scaricare', 1800); return; }
+        try {
+          __msGalleryState.items.forEach(function(item, idx) {
+            setTimeout(function() {
+              var a = document.createElement('a');
+              a.href = __msToLocalImageUrl(item.path);
+              a.download = item.fileName || ('foto_' + (idx + 1) + '.jpg');
+              a.style.display = 'none';
+              (document.body || document.documentElement).appendChild(a);
+              a.click();
+              if (a.parentNode) a.parentNode.removeChild(a);
+            }, idx * 90);
+          });
+          showToast('Download foto avviato', 1800, '#22c55e');
+        } catch (_) {
+          showToast('Download non disponibile', 2000);
+        }
+      });
+      bindBtn('ms-gallery-viewer-close', function() { __msCloseGalleryViewer(); });
+      bindBtn('ms-gallery-viewer-prev', function() {
+        if (!__msGalleryState.items.length) return;
+        __msGalleryState.index = (__msGalleryState.index - 1 + __msGalleryState.items.length) % __msGalleryState.items.length;
+        __msRenderGalleryViewer();
+      });
+      bindBtn('ms-gallery-viewer-next', function() {
+        if (!__msGalleryState.items.length) return;
+        __msGalleryState.index = (__msGalleryState.index + 1) % __msGalleryState.items.length;
+        __msRenderGalleryViewer();
+      });
+      bindBtn('ms-gallery-viewer-delete', function() {
+        __msDeleteGalleryPhoto(__msGalleryState.index);
+      });
+      var __gModal = document.getElementById('ms-gallery-modal');
+      if (__gModal && !__gModal.dataset.msb) {
+        __gModal.dataset.msb = '1';
+        __gModal.addEventListener('click', function(ev) {
+          if (ev.target === __gModal) __msCloseGallery();
+        });
+      }
+      var __gvModal = document.getElementById('ms-gallery-viewer-modal');
+      if (__gvModal && !__gvModal.dataset.msb) {
+        __gvModal.dataset.msb = '1';
+        __gvModal.addEventListener('click', function(ev) {
+          if (ev.target === __gvModal) __msCloseGalleryViewer();
+        });
+      }
       bindBtn('ms-start-btn', function() {
         console.log('[start] click handler entered');
         try { showToast('START click', 1500, '#22c55e'); } catch(e) {}
@@ -3734,6 +7569,25 @@ function injectRemoteUiRedesign(win, targetFrame) {
           }
           return;
         }
+        // Persisti la selezione evento al momento del click START
+        try {
+          var __startEvtTxt = '';
+          if (evtSel.selectedIndex >= 0 && evtSel.options && evtSel.options[evtSel.selectedIndex]) {
+            var __opt = evtSel.options[evtSel.selectedIndex];
+            __startEvtTxt = String(__opt.text || __opt.textContent || __opt.label || __opt.innerText || '').trim();
+          }
+          console.log('[ms] START event text=\"' + __startEvtTxt + '\" val=' + evtSel.value + ' idx=' + evtSel.selectedIndex);
+          if (__startEvtTxt) {
+            localStorage.setItem(MS_LAST_EVT_KEY, __startEvtTxt);
+            console.log('[ms] saved event at START: ' + __startEvtTxt);
+            // Imposta anche il main process via IPC (doppia sicurezza)
+            try {
+              if (window.electronAPI && typeof window.electronAPI.setCurrentEventFolder === 'function') {
+                window.electronAPI.setCurrentEventFolder(__startEvtTxt).catch(function() {});
+              }
+            } catch (_) {}
+          }
+        } catch (e) { console.log('[ms] START save err: ' + (e && e.message)); }
         var ob = findStartBtn();
         var cdsType = typeof window.count_down_start;
         console.log('[start] remoteBtn=' + (!!ob) + ' cds=' + cdsType);
@@ -3746,23 +7600,52 @@ function injectRemoteUiRedesign(win, targetFrame) {
             window._msSetWindowControlsVisible(true);
           }
         } catch (e) {}
-        hideOverlayForSession(true);
-        syncSessionFrameOverlay();
-        setTimeout(function() { syncSessionFrameOverlay(); }, 120);
-        setTimeout(function() { syncSessionFrameOverlay(); }, 420);
-        setTimeout(function() { syncSessionFrameOverlay(); }, 950);
-        setTimeout(function() { syncSessionFrameOverlay(); }, 1600);
-        if (ob) {
-          console.log('[start] clicking remote btn');
-          console.log('[start] btn info: tag=' + ob.tagName + ' id=' + (ob.id||'-') + ' name=' + (ob.name||'-') + ' type=' + (ob.type||'-') + ' onclick=' + (typeof ob.onclick));
-          try { ob.click(); } catch(e) { console.log('[start] click err: ' + e.message); }
+        var hasRemoteStartFlow = !!ob || typeof window.count_down_start === 'function';
+        if (hasRemoteStartFlow) {
+          hideOverlayForSession(true);
+          syncSessionFrameOverlay();
+          setTimeout(function() { syncSessionFrameOverlay(); }, 120);
+          setTimeout(function() { syncSessionFrameOverlay(); }, 420);
+          setTimeout(function() { syncSessionFrameOverlay(); }, 950);
+          setTimeout(function() { syncSessionFrameOverlay(); }, 1600);
+          if (ob) {
+            console.log('[start] clicking remote btn');
+            console.log('[start] btn info: tag=' + ob.tagName + ' id=' + (ob.id||'-') + ' name=' + (ob.name||'-') + ' type=' + (ob.type||'-') + ' onclick=' + (typeof ob.onclick));
+            try { ob.click(); } catch(e) { console.log('[start] click err: ' + e.message); }
+          } else {
+            try {
+              if (typeof window.count_down_start === 'function') {
+                console.log('[start] calling count_down_start()');
+                window.count_down_start();
+              }
+            } catch (e) {}
+          }
         } else {
+          // Locale: nessun bottone START remoto. Avviamo la sessione live qui:
+          // 1) garantiamo che la camera sia in streaming
+          // 2) spostiamo <video> fuori da ms-app cosi' resta visibile quando
+          //    hideOverlayForSession nasconde ms-app
           try {
-            if (typeof window.count_down_start === 'function') {
-              console.log('[start] calling count_down_start()');
-              window.count_down_start();
+            var __camSel = document.getElementById('ms-cam-sel');
+            if (__camSel && __camSel.value) startCamera(__camSel.value);
+            else loadCameras();
+          } catch (_) {}
+          try {
+            var __cv = document.getElementById('ms-cam-video');
+            if (__cv) {
+              if (!__cv.dataset.msHomeParentId) {
+                __cv.dataset.msHomeParentId = (__cv.parentNode && __cv.parentNode.id) || 'ms-preview-inner';
+                __cv.dataset.msHomeStyle = __cv.getAttribute('style') || '';
+              }
+              __cv.style.cssText = 'position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:cover!important;z-index:2147482999!important;background:#000!important;transform:scaleX(-1);';
+              (document.documentElement || document.body).appendChild(__cv);
+              var __pp = __cv.play && __cv.play(); if (__pp && __pp.catch) __pp.catch(function(){});
             }
-          } catch (e) {}
+          } catch (_) {}
+          hideOverlayForSession(true);
+          syncSessionFrameOverlay();
+          setTimeout(function() { syncSessionFrameOverlay(); }, 120);
+          setTimeout(function() { syncSessionFrameOverlay(); }, 420);
         }
       });
       // File picker tramite label+input — il click utente va diretto all'input senza JS intermedio
@@ -3781,24 +7664,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
               failed = true;
             }
             if (!finalUrl) {
-              var reader = new FileReader();
-              reader.onloadend = function() {
-                var fallbackUrl = typeof reader.result === 'string' ? reader.result : '';
-                if (!fallbackUrl) {
-                  showToast('Impossibile caricare la cornice: ' + file.name, 2500);
-                  return;
-                }
-                window._msLocalFrames.push({ url: fallbackUrl, name: file.name });
-                savePersistedLocalFrames();
-                setSelectedFrameName(file.name);
-                renderLocalFrames();
-                syncSessionFrameOverlay();
-                showToast('\u2713 Cornice aggiunta: ' + file.name, 2500, '#22c55e');
-              };
-              reader.onerror = function() {
-                showToast('Impossibile caricare la cornice: ' + file.name, 2500);
-              };
-              reader.readAsDataURL(file);
+              showToast('Impossibile adattare la cornice SELPHY: ' + file.name, 2500);
               return;
             }
             window._msLocalFrames.push({ url: finalUrl, name: file.name });
@@ -3877,6 +7743,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
 
     // ── SESSIONE / REVIEW ─────────────────────────────────────────────────
     var _msReviewActive = !!_msSessionPersistedAtBoot;
+    var _msHideOverlayTimer = null;
 
     var readSessionState = function() { return _msReviewActive; };
 
@@ -3899,9 +7766,27 @@ function injectRemoteUiRedesign(win, targetFrame) {
     var restoreOverlay = function(force) {
       if (!_msReviewActive && !force) return;
       _msReviewActive = false;
+      if (_msHideOverlayTimer) {
+        clearTimeout(_msHideOverlayTimer);
+        _msHideOverlayTimer = null;
+      }
       writeSessionState(false);
       document.documentElement.removeAttribute('data-ms-nav');
       document.documentElement.removeAttribute('data-ms-session');
+      // Rimetti ms-cam-video nella sua sede originale se era stato spostato in modalità locale.
+      try {
+        var __cvR = document.getElementById('ms-cam-video');
+        if (__cvR && __cvR.dataset && __cvR.dataset.msHomeParentId) {
+          var __homeParent = document.getElementById(__cvR.dataset.msHomeParentId) || document.getElementById('ms-preview-inner');
+          if (__homeParent && __cvR.parentNode !== __homeParent) {
+            __homeParent.appendChild(__cvR);
+          }
+          var __prevStyle = __cvR.dataset.msHomeStyle || '';
+          if (__prevStyle) __cvR.setAttribute('style', __prevStyle); else __cvR.removeAttribute('style');
+          delete __cvR.dataset.msHomeParentId;
+          delete __cvR.dataset.msHomeStyle;
+        }
+      } catch (_) {}
       var app = document.getElementById('ms-app');
       if (app) {
         app.classList.remove('ms-app-out');
@@ -3936,13 +7821,34 @@ function injectRemoteUiRedesign(win, targetFrame) {
       if (_msReviewActive && !force) return;
       _msReviewActive = true;
       writeSessionState(true);
-      document.documentElement.setAttribute('data-ms-session', '1');
       var app = document.getElementById('ms-app');
-      if (app) {
-        app.style.display = 'none';
-        app.style.opacity = '';
+      var finalizeHide = function() {
+        document.documentElement.setAttribute('data-ms-session', '1');
+        if (app) {
+          app.classList.remove('ms-app-out');
+          app.style.display = 'none';
+          app.style.opacity = '';
+          app.style.pointerEvents = 'none';
+          app.style.zIndex = '-1';
+        }
+      };
+      if (_msHideOverlayTimer) {
+        clearTimeout(_msHideOverlayTimer);
+        _msHideOverlayTimer = null;
+      }
+      var shouldAnimateHide = !!app && !(_msSessionPersistedAtBoot && force);
+      if (shouldAnimateHide) {
+        app.style.display = '';
+        app.style.opacity = '1';
         app.style.pointerEvents = 'none';
-        app.style.zIndex = '-1';
+        app.style.zIndex = '999998';
+        app.classList.add('ms-app-out');
+        _msHideOverlayTimer = setTimeout(function() {
+          _msHideOverlayTimer = null;
+          finalizeHide();
+        }, 180);
+      } else {
+        finalizeHide();
       }
       var blocker = document.getElementById('ms-session-blocker');
       if (blocker) {
@@ -3994,6 +7900,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
       }
       var ov = document.getElementById('ms-frame-ov');
       if (ov) { ov.src = nextFrame.url; ov.style.display = 'block'; }
+      try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
       syncSessionFrameOverlay();
       showToast('◀ ' + (nextFrame.name || 'Cornice ' + (nextIdx + 1)) + ' ▶  (' + (nextIdx + 1) + '/' + frames.length + ')', 1500, '#6366f1');
     };
@@ -4211,7 +8118,8 @@ function createWindow() {
         }
     });
 
-    mainWindow.loadURL('https://webservice.sballando.it/mirror/index.php');
+    const homePageUrl = 'file:///' + path.join(__dirname, 'local-home.html').replace(/\\/g, '/');
+    mainWindow.loadURL(homePageUrl);
     mainWindow.setMenu(null);
     enforceTvSize(mainWindow);
 
@@ -4248,26 +8156,23 @@ function createWindow() {
         console.log(`[renderer] ${message} (${sourceId}:${line})`);
       }
     });
-
-    // Inietta l'intercettore cornice il piu' presto possibile, prima che gli
-    // script della pagina remota possano caricare un'Image() con URL mancante.
     mainWindow.webContents.on('dom-ready', () => {
       console.log('[nav] dom-ready url=' + mainWindow.webContents.getURL());
-      // CSS preventivo: nasconde i vecchi controlli/checkbox della pagina
-      // remota PRIMA che il nostro overlay JS abbia tempo di girare. Cosi'
-      // l'utente non vede mai un flash del vecchio pannello al boot.
+      // CSS preventivo: nasconde i vecchi controlli della pagina remota.
       try {
-        mainWindow.webContents.insertCSS([
-          '#captureBtn,#controls_main,#controls_buttons,.controls_main,',
-          '#controls_user,#controls_user_temp,#controls_user *,#controls_user_temp *,',
-          '#print,label#print,#print_foto,label[for=print_foto]',
-          '{opacity:0!important;visibility:hidden!important;pointer-events:none!important;}',
-          '#print,label#print,#print_foto,label[for=print_foto]',
-          '{display:none!important;width:0!important;height:0!important;position:absolute!important;left:-99999px!important;}'
-        ].join(''));
+        mainWindow.webContents.insertCSS(
+          '#captureBtn,#controls_main,#controls_buttons,.controls_main,' +
+          '#controls_user,#controls_user_temp,#controls_user *,#controls_user_temp *,' +
+          '#print,label#print,#print_foto,label[for=print_foto]' +
+          '{opacity:0!important;visibility:hidden!important;pointer-events:none!important;}'
+        );
       } catch (e) { console.log('[nav] insertCSS err: ' + e.message); }
       injectFrameUrlInterceptor(mainWindow);
       injectSessionFrameOverlay(mainWindow);
+      // Inietta ms-app subito a dom-ready: crea l'overlay e ripristina opacity in
+      // un unico round, eliminando la schermata nera. Il guard interno evita la
+      // doppia esecuzione quando did-finish-load richiama la stessa funzione.
+      injectRemoteUiRedesign(mainWindow);
     });
 
     mainWindow.webContents.on('did-start-loading', () => {
@@ -4297,9 +8202,10 @@ function createWindow() {
       // Safety: alcune macchine possono uscire da fullscreen durante il cambio pagina.
       // Re-applica fullscreen quando la session page ha finito di caricarsi.
       try {
-        const pathname = new URL(currentUrl).pathname;
+        const parsedUrl = new URL(currentUrl);
+        const pathname = parsedUrl.pathname;
         const isMirrorSessionPage = /\/mirror\/index\d+\.php$/i.test(pathname);
-        const isMirrorHomePage = /\/mirror\/index\.php$/i.test(pathname);
+        const isMirrorHomePage = /\/mirror\/index\.php$/i.test(pathname) || /local-home\.html$/i.test(pathname);
         if (isMirrorSessionPage && mainWindow && !mainWindow.isDestroyed()) {
           msSessionModeActive = true;
           mainWindow.setFullScreen(true);
@@ -4394,8 +8300,8 @@ function createWindow() {
       try {
         const targetPathname = new URL(url).pathname;
         const isMirrorSessionPage = /\/mirror\/index\d+\.php$/i.test(targetPathname);
-        const isMirrorHomePage = /\/mirror\/index\.php$/i.test(targetPathname);
-        const isMirrorIndexPage = /\/mirror\/index\d*\.php$/i.test(targetPathname);
+        const isMirrorHomePage = /\/mirror\/index\.php$/i.test(targetPathname) || /local-home\.html$/i.test(targetPathname);
+        const isMirrorIndexPage = /\/mirror\/index\d*\.php$/i.test(targetPathname) || /local-home\.html$/i.test(targetPathname);
 
         if (isMirrorSessionPage) {
           // Navigazione verso pagina sessione: imposta flag PRIMA che la pagina carichi.
@@ -4459,6 +8365,7 @@ function createWindow() {
     });
 
     session.defaultSession.on('will-download', (event, item, webContents) => {
+        console.log('[ms] will-download fired filename=' + (item.getFilename() || '') + ' url=' + String(item.getURL() || '').slice(0, 80));
         try {
           const fileNameFull = String(item.getFilename() || '').trim();
           const sep = fileNameFull.includes('§') ? '§' : (fileNameFull.includes('Â§') ? 'Â§' : null);
@@ -4522,7 +8429,7 @@ ipcMain.handle('set-session-mode', async (event, active) => {
 
 ipcMain.handle('navigate-home', async () => {
   msSessionModeActive = false;
-  const homeUrl = 'https://webservice.sballando.it/mirror/index.php';
+  const homeUrl = 'file:///' + path.join(__dirname, 'local-home.html').replace(/\\/g, '/');
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.loadURL(homeUrl).catch(() => {});
   }
@@ -4573,27 +8480,188 @@ ipcMain.handle('get-printers', async () => {
     }
 });
 
+ipcMain.handle('list-system-printers', async () => {
+    return new Promise((resolve) => {
+        try {
+            const script = "$ErrorActionPreference='SilentlyContinue';[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;@(Get-Printer 2>$null | Select-Object Name,PrinterStatus,Default) | ConvertTo-Json -Depth 3 -Compress";
+            execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 4500, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+                if (err) { resolve({ success: false, printers: [], message: err.message }); return; }
+                try {
+                    const txt = String(stdout || '').trim();
+                    if (!txt) { resolve({ success: true, printers: [] }); return; }
+                    const parsed = JSON.parse(txt);
+                    const arr = Array.isArray(parsed) ? parsed : [parsed];
+                    resolve({
+                        success: true,
+                        printers: arr.filter(Boolean).map((p) => ({
+                            name: String((p && p.Name) || ''),
+                            status: String((p && p.PrinterStatus) || ''),
+                            isDefault: !!(p && p.Default),
+                        })).filter((p) => p.name),
+                    });
+                } catch (e) {
+                    resolve({ success: false, printers: [], message: 'ParseError: ' + e.message });
+                }
+            });
+        } catch (e) {
+            resolve({ success: false, printers: [], message: e.message });
+        }
+    });
+});
+
+ipcMain.handle('get-printer-state', async (_event, force) => {
+    try {
+        return await msComputePrinterState(!!force);
+    } catch (e) {
+        return { printerName: selectedPrinterName || '', status: 'error', label: 'Errore lettura stato', jobs: [], jobCount: 0, hasActiveJob: false, message: e.message || '', progress: 0 };
+    }
+});
+
+ipcMain.handle('set-selected-printer', async (_event, name) => {
+    try {
+        selectedPrinterName = String(name || '').trim();
+        msSavePersistedPrinter();
+        const st = await msComputePrinterState(true);
+        msBroadcastPrinterState(st);
+        return { success: true, printerName: selectedPrinterName, state: st };
+    } catch (e) {
+        return { success: false, message: e.message };
+    }
+});
+
+ipcMain.handle('get-selected-printer', async () => {
+    return { printerName: selectedPrinterName || '' };
+});
+
+ipcMain.handle('get-print-calibration', async () => {
+    return { ...printCalibration };
+});
+
+ipcMain.handle('set-print-calibration', async (_event, payload) => {
+    try {
+        printCalibration = msClampCalibration(payload || {});
+        msSavePersistedPrinter();
+        return { success: true, calibration: { ...printCalibration } };
+    } catch (e) {
+        return { success: false, message: e && e.message || 'set-print-calibration failed' };
+    }
+});
+
+ipcMain.handle('print-test-pattern', async (_event, payload) => {
+    try {
+        const targetPrinter = String((payload && payload.printerName) || selectedPrinterName || '').trim();
+        if (!targetPrinter) {
+            return { success: false, code: 'NO_PRINTER', message: 'Stampante non selezionata' };
+        }
+        const preState = await msComputePrinterState(true);
+        if (activePrintJob || preState.status === 'busy') {
+            return { success: false, busy: true, message: 'Stampante occupata: attendi la stampa corrente', state: preState };
+        }
+        if (preState.status === 'offline') {
+            return { success: false, code: 'OFFLINE', message: preState.label || 'Stampante offline', state: preState };
+        }
+        if (preState.status === 'error') {
+            return { success: false, code: 'ERROR', message: preState.label || 'Errore stampante', state: preState };
+        }
+        const cal = msClampCalibration((payload && payload.calibration) || printCalibration);
+        activePrintJob = { brokerJobId: null, fileName: '__calibration_test__', startedAt: Date.now() };
+        msStartPrinterPolling();
+        try {
+            const direct = await msSubmitDirectWindowsPrint(null, targetPrinter, { calibration: cal, testPattern: true });
+            if (activePrintJob) activePrintJob.brokerJobId = direct.id;
+            msBroadcastPrinterState(await msComputePrinterState(true));
+            return { success: true, id: direct.id, direct: true, calibration: cal };
+        } catch (e) {
+            activePrintJob = null;
+            msBroadcastPrinterState(await msComputePrinterState(true));
+            return { success: false, message: e && e.message || 'print-test-pattern failed' };
+        }
+    } catch (e) {
+        return { success: false, message: e && e.message || 'print-test-pattern error' };
+    }
+});
+
+ipcMain.handle('resolve-original-photo-path', async (_event, eventName, photoId) => {
+    try {
+        const evt = String(eventName || '').trim();
+        const id = String(photoId || '').trim();
+        const p = resolvePhotoPathByEventAndId(evt, id);
+        try { console.log('[resolve-original-photo-path]', { eventName: evt, photoId: id, resolved: p }); } catch (_) {}
+        if (!p) return { success: false, message: 'File originale non trovato per ID ' + id };
+        return { success: true, path: p };
+    } catch (err) {
+        return { success: false, message: err && err.message ? err.message : 'errore risoluzione path' };
+    }
+});
+
 ipcMain.handle('print-image', async (event, filename, printerName, options = {}) => {
     try {
+        try { console.log('[print-image] richiesta', { filename, printerName: printerName || selectedPrinterName }); } catch (_) {}
+        const targetPrinter = String(printerName || selectedPrinterName || '').trim();
+        if (!targetPrinter) {
+            return { success: false, code: 'NO_PRINTER', message: 'Stampante non selezionata' };
+        }
+        const preState = await msComputePrinterState(true);
+        if (activePrintJob || preState.status === 'busy') {
+            return { success: false, busy: true, message: 'Stampante occupata: attendi la stampa corrente', state: preState };
+        }
+        if (preState.status === 'offline') {
+            return { success: false, code: 'OFFLINE', message: preState.label || 'Stampante offline', state: preState };
+        }
+        if (preState.status === 'error') {
+            return { success: false, code: 'ERROR', message: preState.label || 'Errore stampante', state: preState };
+        }
+
         const imagePath = resolveImagePath(filename);
+        try { console.log('[print-image] path risolto', { imagePath }); } catch (_) {}
 
         await fs.access(imagePath);
 
         const payload = {
             imagePath,
-            printerName,
+            printerName: targetPrinter,
             copies: options.copies || 1,
             paperSize: options.paperSize || 'Paper10x15',
             orientation: options.orientation || 'Portrait',
             metadata: options.metadata || {}
         };
 
-        const response = await callPrintBroker('/jobs', {
-            method: 'POST',
-            body: JSON.stringify(payload)
-        });
-
-        return { success: true, ...response };
+        activePrintJob = { brokerJobId: null, fileName: filename, startedAt: Date.now() };
+        msStartPrinterPolling();
+        try {
+            const response = await callPrintBroker('/jobs', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+            if (response && response.id) activePrintJob.brokerJobId = response.id;
+            msBroadcastPrinterState(await msComputePrinterState(true));
+            return { success: true, ...response };
+        } catch (submitErr) {
+            if (msIsBrokerUnavailableError(submitErr)) {
+                try {
+                    const direct = await msSubmitDirectWindowsPrint(imagePath, targetPrinter);
+                    if (activePrintJob) activePrintJob.brokerJobId = direct.id;
+                    msBroadcastPrinterState(await msComputePrinterState(true));
+                    return {
+                        success: true,
+                        id: direct.id,
+                        direct: true,
+                        message: 'Stampa avviata in fallback locale (broker offline)'
+                    };
+                } catch (directErr) {
+                    activePrintJob = null;
+                    msBroadcastPrinterState(await msComputePrinterState(true));
+                    return {
+                        success: false,
+                        code: 'BROKER_OFFLINE_FALLBACK_FAILED',
+                        message: 'Broker offline e stampa diretta fallita: ' + (directErr && directErr.message ? directErr.message : 'errore sconosciuto')
+                    };
+                }
+            }
+            activePrintJob = null;
+            msBroadcastPrinterState(await msComputePrinterState(true));
+            throw submitErr;
+        }
     } catch (error) {
         console.error('Errore submit job stampa:', error);
         return { success: false, message: error.message };
@@ -4730,6 +8798,63 @@ ipcMain.handle('set-current-event-folder', async (_event, eventName) => {
   }
 });
 
+ipcMain.handle('get-event-photos', async (_event, eventName) => {
+  try {
+    const raw = String(eventName || '').trim();
+    let folder = getCurrentEventFolderName();
+    if (raw && raw !== 'evento_senza_nome') {
+      folder = setCurrentEventFolderName(raw);
+    }
+    const rootPath = getPhotoRootPath();
+    const folderPath = path.join(rootPath, folder);
+    await fs.mkdir(folderPath, { recursive: true });
+
+    let names = [];
+    try {
+      names = await fs.readdir(folderPath);
+    } catch (_) {
+      names = [];
+    }
+
+    const photos = [];
+    for (const name of names) {
+      if (!/\.(jpg|jpeg|png|webp)$/i.test(name)) continue;
+      const abs = path.join(folderPath, name);
+      let stat = null;
+      try { stat = await fs.stat(abs); } catch (_) { stat = null; }
+      const seq = extractPhotoSeqId(name);
+      photos.push({
+        id: seq ? String(seq).padStart(4, '0') : '',
+        seq: seq || 0,
+        fileName: name,
+        path: abs,
+        mtimeMs: stat && stat.mtimeMs ? Math.floor(stat.mtimeMs) : 0,
+      });
+    }
+
+    photos.sort((a, b) => {
+      if ((b.seq || 0) !== (a.seq || 0)) return (b.seq || 0) - (a.seq || 0);
+      if ((b.mtimeMs || 0) !== (a.mtimeMs || 0)) return (b.mtimeMs || 0) - (a.mtimeMs || 0);
+      return String(b.fileName || '').localeCompare(String(a.fileName || ''));
+    });
+
+    let nextId = photos.length + 1;
+    for (const p of photos) {
+      if ((p.seq || 0) >= nextId) nextId = p.seq + 1;
+    }
+
+    return {
+      success: true,
+      folder,
+      photos,
+      nextId,
+      nextIdText: String(nextId).padStart(4, '0'),
+    };
+  } catch (error) {
+    return { success: false, message: error.message, photos: [], nextId: 1, nextIdText: '0001' };
+  }
+});
+
 ipcMain.handle('save-captured-photo', async (_event, payload) => {
   try {
     const dataUrl = String(payload && payload.dataUrl ? payload.dataUrl : '').trim();
@@ -4752,30 +8877,37 @@ ipcMain.handle('save-captured-photo', async (_event, payload) => {
     else if (mime.indexOf('webp') >= 0) ext = '.webp';
 
     let eventFolder = getCurrentEventFolderName();
-    if (rawEventName) {
+    // Ignora rawEventName se è il valore di fallback: il main process ha già il valore corretto
+    if (rawEventName && rawEventName !== 'evento_senza_nome') {
       eventFolder = setCurrentEventFolderName(rawEventName);
     }
-
     let fileName = path.basename(rawFileName || '').trim();
     if (fileName.includes('§')) {
       const sep = fileName.includes('§') ? '§' : 'Â§';
       const p = fileName.split(sep);
       if (p.length > 1) {
-        eventFolder = resolveEventFolderName(p[0]);
+        // Usa il folder dal filename SOLO se non è stato specificato un eventName dal pannello
+        if (!rawEventName) {
+          eventFolder = resolveEventFolderName(p[0]);
+        }
         fileName = path.basename(p.slice(1).join(sep)).trim();
       }
     }
 
-    if (!fileName) {
-      fileName = 'foto_' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + ext;
-    }
-    if (!/\.(jpg|jpeg|png|webp)$/i.test(fileName)) {
-      fileName += ext;
-    }
-
+    // Filename = <nome_evento>_<ID progressivo>.ext
     const rootPath = getPhotoRootPath();
     const folderPath = path.join(rootPath, eventFolder);
     await fs.mkdir(folderPath, { recursive: true });
+    // Conta i file già presenti per generare l'ID progressivo
+    let nextId = 1;
+    try {
+      const existing = await fs.readdir(folderPath);
+      const photos = existing.filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f));
+      nextId = photos.length + 1;
+    } catch (_) {}
+    const seqId = String(nextId).padStart(4, '0');
+    fileName = eventFolder + '_' + seqId + ext;
+
     const targetPath = path.join(folderPath, fileName);
 
     const bytes = Buffer.from(b64, 'base64');

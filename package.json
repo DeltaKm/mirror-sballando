@@ -37,6 +37,7 @@
       "preload.js",
       "favicon.ico",
       "favicon.png",
+      "local-home.html",
       "package.json"
     ],
     "nsis": {
