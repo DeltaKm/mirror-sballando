@@ -3801,8 +3801,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
         box-shadow: 0 4px 20px rgba(230,57,70,0.45);
         transition: background 0.2s, transform 0.15s, box-shadow 0.2s; font-family: inherit;
       }
-      #ms-start-btn:hover { background: #c62828; transform: scale(1.04); box-shadow: 0 6px 28px rgba(230,57,70,0.6); }
-      #ms-start-btn:active { transform: scale(0.97); }
+      #ms-start-btn:hover { background: #c62828; box-shadow: 0 6px 28px rgba(230,57,70,0.6); }
+      #ms-start-btn:active { filter: brightness(0.95); }
       #ms-gallery-btn {
         position: absolute; top: 62px; right: 14px; z-index: 10;
         background: rgba(22,22,28,0.82); color: #fff; border: 1px solid rgba(255,255,255,0.16); border-radius: 10px;
@@ -3934,8 +3934,9 @@ function injectRemoteUiRedesign(win, targetFrame) {
       @media (max-width: 1280px) { .ms-g-row { gap: 16px; } .ms-g-item { flex-basis: clamp(228px, 28vw, 290px); width: clamp(228px, 28vw, 290px); } }
       @media (max-width: 980px) { #ms-gallery-card { width: 94vw; height: 84vh; } #ms-gallery-grid { padding: 10px 10px 12px; } .ms-g-row { gap: 12px; } .ms-g-item { flex-basis: clamp(210px, 42vw, 270px); width: clamp(210px, 42vw, 270px); height: clamp(430px, 62vh, 520px); } }
       #ms-gallery-viewer-modal { position: fixed; inset: 0; z-index: 2147483600; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.86); }
-      #ms-gallery-viewer-card { position: relative; width: min(96vw, 860px); height: min(90vh, 1260px); display: flex; align-items: center; justify-content: center; }
-      #ms-gallery-viewer-media { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; box-shadow: 0 20px 70px rgba(0,0,0,0.7); }
+      #ms-gallery-viewer-card { position: relative; width: min(96vw, 860px); height: min(90vh, 1260px); display: flex; align-items: center; justify-content: center; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
+      #ms-gallery-viewer-card.ms-dragging { cursor: grabbing; }
+      #ms-gallery-viewer-media { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; box-shadow: 0 20px 70px rgba(0,0,0,0.7); -webkit-user-drag: none; user-select: none; -webkit-user-select: none; }
       .ms-gv-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.26); background: rgba(0,0,0,0.55); color: #fff; font-size: 28px; line-height: 1; cursor: pointer; }
       #ms-gallery-viewer-prev { left: 12px; }
       #ms-gallery-viewer-next { right: 12px; }
@@ -4031,11 +4032,18 @@ function injectRemoteUiRedesign(win, targetFrame) {
         box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.30);
       }
       .ms-logo {
-        font-size: 24px !important; font-weight: 800 !important; letter-spacing: -0.02em !important;
-        color: #f5f5f7 !important;
-        text-shadow: 0 0 22px rgba(230,57,70,0.18), 0 1px 0 rgba(0,0,0,0.6);
+        display: inline-flex !important; align-items: center; height: 100%;
+        text-shadow: none !important;
       }
-      .ms-logo em { color: #E63946 !important; text-shadow: 0 0 14px rgba(230,57,70,0.55); }
+      #ms-logo-img {
+        display: block;
+        height: 40px;
+        width: auto;
+        max-width: 220px;
+        object-fit: contain;
+        user-select: none;
+        -webkit-user-drag: none;
+      }
       .ms-status { gap: 10px !important; margin-left: auto; }
       .ms-si {
         padding: 5px 10px; border-radius: 999px;
@@ -4151,7 +4159,18 @@ function injectRemoteUiRedesign(win, targetFrame) {
         padding: 14px 6px 10px;
         flex: 0 0 auto;
         animation: msFadeInUp 0.6s ease-out both;
+        pointer-events: auto !important;
+        position: relative;
+        z-index: 5;
       }
+      #ms-frames-section *,
+      #ms-c-frames.ms-frames-strip,
+      #ms-c-frames.ms-frames-strip * {
+        pointer-events: auto;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi::after,
+      #ms-c-frames.ms-frames-strip .ms-fi-del { pointer-events: none; }
+      #ms-c-frames.ms-frames-strip .ms-fi-del { pointer-events: auto !important; }
       .ms-frames-head {
         display: flex; align-items: center; justify-content: space-between;
         margin: 0 8px 10px;
@@ -4163,6 +4182,24 @@ function injectRemoteUiRedesign(win, targetFrame) {
         text-transform: uppercase;
       }
       .ms-frames-title svg { color: rgba(255,90,103,0.85); }
+      .ms-frames-nav { display: inline-flex; align-items: center; gap: 8px; }
+      .ms-frames-arrow {
+        width: 32px; height: 32px;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 10px;
+        color: rgba(255,255,255,0.78);
+        cursor: pointer;
+        transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 120ms ease, opacity 160ms ease;
+      }
+      .ms-frames-arrow:hover:not(:disabled) {
+        background: rgba(230,57,70,0.14);
+        border-color: rgba(230,57,70,0.45);
+        color: #ffd8dc;
+      }
+      .ms-frames-arrow:active:not(:disabled) { transform: scale(0.94); }
+      .ms-frames-arrow:disabled { opacity: 0.32; cursor: not-allowed; }
       .ms-frames-add {
         display: inline-flex; align-items: center; gap: 6px;
         font-size: 11px; font-weight: 600;
@@ -4203,7 +4240,6 @@ function injectRemoteUiRedesign(win, targetFrame) {
         padding: 6px 8px 10px !important;
         overflow-x: auto !important;
         overflow-y: hidden !important;
-        scroll-snap-type: x mandatory;
         scrollbar-width: thin;
         scrollbar-color: rgba(230,57,70,0.45) transparent;
       }
@@ -4225,13 +4261,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
         border: 2px solid rgba(255,255,255,0.10) !important;
         background: #0a0a0f !important;
         flex: 0 0 auto !important;
-        scroll-snap-align: start;
         overflow: hidden !important;
         cursor: pointer;
-        transition: transform 220ms cubic-bezier(0.22,0.94,0.32,1.0),
-                    border-color 220ms ease,
-                    box-shadow 220ms ease,
-                    filter 220ms ease;
+        transform: none !important;
+        transition: border-color 140ms ease, box-shadow 140ms ease;
       }
       #ms-c-frames.ms-frames-strip .ms-fi::after {
         content: '';
@@ -4241,33 +4274,40 @@ function injectRemoteUiRedesign(win, targetFrame) {
         pointer-events: none;
       }
       #ms-c-frames.ms-frames-strip .ms-fi:hover {
-        transform: translateY(-4px) scale(1.04) !important;
-        border-color: rgba(255,90,103,0.65) !important;
-        box-shadow:
-          0 12px 28px rgba(0,0,0,0.55),
-          0 0 24px rgba(230,57,70,0.30),
-          0 0 0 1px rgba(255,90,103,0.45) !important;
-        filter: brightness(1.05);
+        border-color: rgba(255,90,103,0.55) !important;
+        box-shadow: 0 0 0 1px rgba(255,90,103,0.35) !important;
       }
-      #ms-c-frames.ms-frames-strip .ms-fi:hover::after { opacity: 1; }
+      /* Cornice selezionata: stessa posizione, ring rosso + glow stabile */
       #ms-c-frames.ms-frames-strip .ms-fi.sel {
         border-color: #ff5d6c !important;
+        transform: none !important;
+        z-index: 2;
         box-shadow:
-          0 14px 32px rgba(0,0,0,0.55),
-          0 0 28px rgba(230,57,70,0.45),
-          0 0 0 2px rgba(255,90,103,0.85) !important;
-        transform: translateY(-2px) scale(1.03) !important;
+          0 12px 30px rgba(0,0,0,0.55),
+          0 0 26px rgba(230,57,70,0.40),
+          0 0 0 3px rgba(255,90,103,0.95),
+          0 0 0 6px rgba(255,90,103,0.14) !important;
       }
+      /* Sostituisce l'overlay scuro ::after del default per l'elemento selezionato */
+      #ms-c-frames.ms-frames-strip .ms-fi.sel::after {
+        opacity: 0 !important;
+      }
+      /* Badge check tondo in alto a destra */
       #ms-c-frames.ms-frames-strip .ms-fi.sel::before {
         content: '';
-        position: absolute; top: 7px; right: 7px; z-index: 3;
-        width: 22px; height: 22px;
+        position: absolute; top: 8px; right: 8px; z-index: 3;
+        width: 26px; height: 26px;
         border-radius: 999px;
-        background: #ff4d6d;
-        box-shadow: 0 4px 14px rgba(230,57,70,0.55), 0 0 0 2px rgba(0,0,0,0.4);
-        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'/></svg>");
-        background-repeat: no-repeat;
-        background-position: center;
+        pointer-events: none;
+        box-shadow:
+          0 4px 14px rgba(230,57,70,0.55),
+          0 0 0 2px rgba(0,0,0,0.50),
+          inset 0 1px 0 rgba(255,255,255,0.30);
+        background-image:
+          url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='15' height='15' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'/></svg>"),
+          linear-gradient(135deg, #ff6b7e 0%, #e63946 60%, #b8203a 100%);
+        background-repeat: no-repeat, no-repeat;
+        background-position: center, center;
       }
 
       /* Tile "+ Aggiungi" come prima opzione speciale (se presente) */
@@ -4642,8 +4682,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         transition: opacity 320ms ease;
       }
       #ms-start-btn:hover {
-        transform: translateY(-2px) scale(1.02);
-        filter: brightness(1.06);
+        transform: none;
         box-shadow:
           0 22px 50px rgba(230,57,70,0.58),
           0 6px 18px rgba(230,57,70,0.40),
@@ -4651,10 +4690,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
           inset 0 -2px 0 rgba(0,0,0,0.18),
           0 0 0 1px rgba(255,120,135,0.85) !important;
       }
-      #ms-start-btn:hover::before { opacity: 1; }
       #ms-start-btn:active {
-        transform: translateY(1px) scale(0.985);
-        filter: brightness(0.96);
+        transform: none;
         box-shadow:
           0 8px 18px rgba(230,57,70,0.40),
           inset 0 2px 4px rgba(0,0,0,0.30),
@@ -4900,7 +4937,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         border-width: 2px !important;
         transition: transform 0.22s cubic-bezier(.22,1.2,.36,1), border-color 0.22s, box-shadow 0.22s !important;
       }
-      .ms-fi:hover { transform: scale(1.08) translateY(-2px) !important; box-shadow: 0 10px 22px rgba(0,0,0,0.50); }
+      .ms-fi:hover { transform: none !important; box-shadow: 0 10px 22px rgba(0,0,0,0.50); }
       .ms-fi.sel {
         border-color: #E63946 !important;
         box-shadow: 0 0 0 1px rgba(230,57,70,0.4), 0 0 20px rgba(230,57,70,0.55), 0 8px 22px rgba(0,0,0,0.45) !important;
@@ -4930,7 +4967,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
       appDiv.id = 'ms-app';
       appDiv.innerHTML =
         '<div id="ms-topbar">' +
-          '<div class="ms-logo">s<em>b</em>allando</div>' +
+          '<div class="ms-logo"><img src="logo%20sballando.png" alt="sballando" id="ms-logo-img"/></div>' +
           '<div class="ms-status">' +
             '<div class="ms-si" id="ms-si-cam"><span class="ms-dot" id="ms-d-cam"></span><span>Camera</span></div>' +
             '<div class="ms-si" id="ms-si-prt"><span class="ms-dot" id="ms-d-prt"></span><span id="ms-prt-label">Stampante</span><div class="ms-prt-progress" id="ms-prt-progress"><div class="ms-prt-progress-bar" id="ms-prt-progress-bar"></div></div></div>' +
@@ -6738,6 +6775,13 @@ function injectRemoteUiRedesign(win, targetFrame) {
       if (modal) modal.style.display = 'none';
     };
 
+    var __msStepGalleryViewer = function(direction) {
+      if (!__msGalleryState.items.length) return;
+      var dir = direction >= 0 ? 1 : -1;
+      __msGalleryState.index = (__msGalleryState.index + dir + __msGalleryState.items.length) % __msGalleryState.items.length;
+      __msRenderGalleryViewer();
+    };
+
     var __msDeleteGalleryPhoto = function(index) {
       if (!window.electronAPI || typeof window.electronAPI.deletePhoto !== 'function') {
         showToast('Eliminazione non disponibile', 2200);
@@ -7240,7 +7284,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           if (!section) {
             section = document.createElement('div');
             section.id = 'ms-frames-section';
-            // Header con titolo + bottone aggiungi (proxy verso input file esistente)
+            // Header con titolo + frecce navigazione + bottone aggiungi
             var head = document.createElement('div');
             head.className = 'ms-frames-head';
             head.innerHTML =
@@ -7248,10 +7292,18 @@ function injectRemoteUiRedesign(win, targetFrame) {
                 '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 7h10v10H7z"/></svg>' +
                 '<span>Cornici</span>' +
               '</div>' +
-              '<button type="button" class="ms-frames-add" id="ms-frames-add-proxy">' +
-                '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
-                '<span>Aggiungi</span>' +
-              '</button>';
+              '<div class="ms-frames-nav">' +
+                '<button type="button" class="ms-frames-arrow" id="ms-frames-prev" aria-label="Scorri indietro">' +
+                  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
+                '</button>' +
+                '<button type="button" class="ms-frames-arrow" id="ms-frames-next" aria-label="Scorri avanti">' +
+                  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>' +
+                '</button>' +
+                '<button type="button" class="ms-frames-add" id="ms-frames-add-proxy">' +
+                  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
+                  '<span>Aggiungi</span>' +
+                '</button>' +
+              '</div>';
             section.appendChild(head);
           }
           // Sposta la card cornici dentro la section (sotto l'header)
@@ -7268,10 +7320,72 @@ function injectRemoteUiRedesign(win, targetFrame) {
           if (proxyBtn && !proxyBtn.dataset.bound) {
             proxyBtn.dataset.bound = '1';
             proxyBtn.addEventListener('click', function() {
+              try { console.log('[ms][frames] Aggiungi click'); } catch(_) {}
               var inp = document.getElementById('ms-frame-file-input');
               if (inp) inp.click();
+              else console.warn('[ms][frames] file input non trovato');
             });
           }
+          // Debug: log su tutti i click dentro la sezione cornici
+          if (section && !section.dataset.dbg) {
+            section.dataset.dbg = '1';
+            section.addEventListener('click', function(ev) {
+              try {
+                var t = ev.target;
+                var fi = t && t.closest && t.closest('.ms-fi');
+                console.log('[ms][frames] section click', {
+                  tag: t && t.tagName,
+                  id: t && t.id,
+                  cls: t && t.className,
+                  onFrame: !!fi,
+                  frameLocal: fi && fi.dataset && fi.dataset.local,
+                  frameName: fi && fi.dataset && fi.dataset.name
+                });
+              } catch (_) {}
+            }, true);
+          }
+          // Wiring frecce navigazione strip
+          var grid = document.getElementById('ms-frames-grid');
+          var prevBtn = document.getElementById('ms-frames-prev');
+          var nextBtn = document.getElementById('ms-frames-next');
+          var updateArrows = function() {
+            if (!grid || !prevBtn || !nextBtn) return;
+            var canScroll = grid.scrollWidth > grid.clientWidth + 2;
+            var atStart = grid.scrollLeft <= 2;
+            var atEnd = grid.scrollLeft + grid.clientWidth >= grid.scrollWidth - 2;
+            prevBtn.disabled = !canScroll || atStart;
+            nextBtn.disabled = !canScroll || atEnd;
+            // Nasconde l'intero gruppo nav quando non c'è nulla da scrollare? No, le manteniamo disabled per coerenza visiva.
+          };
+          if (prevBtn && !prevBtn.dataset.bound) {
+            prevBtn.dataset.bound = '1';
+            prevBtn.addEventListener('click', function() {
+              if (!grid) return;
+              var step = Math.max(grid.clientWidth * 0.6, 144);
+              grid.scrollBy({ left: -step, behavior: 'smooth' });
+            });
+          }
+          if (nextBtn && !nextBtn.dataset.bound) {
+            nextBtn.dataset.bound = '1';
+            nextBtn.addEventListener('click', function() {
+              if (!grid) return;
+              var step = Math.max(grid.clientWidth * 0.6, 144);
+              grid.scrollBy({ left: step, behavior: 'smooth' });
+            });
+          }
+          if (grid && !grid.dataset.boundArrows) {
+            grid.dataset.boundArrows = '1';
+            grid.addEventListener('scroll', updateArrows, { passive: true });
+            // Aggiorna stato frecce quando le cornici cambiano (add/remove)
+            try {
+              var mo = new MutationObserver(function() {
+                requestAnimationFrame(updateArrows);
+              });
+              mo.observe(grid, { childList: true, subtree: false });
+            } catch (_) {}
+          }
+          requestAnimationFrame(updateArrows);
+          window.addEventListener('resize', updateArrows, { passive: true });
         } catch (e) {
           try { console.warn('[ms] frames-section relocate failed:', e.message); } catch(_) {}
         }
@@ -7524,14 +7638,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
       });
       bindBtn('ms-gallery-viewer-close', function() { __msCloseGalleryViewer(); });
       bindBtn('ms-gallery-viewer-prev', function() {
-        if (!__msGalleryState.items.length) return;
-        __msGalleryState.index = (__msGalleryState.index - 1 + __msGalleryState.items.length) % __msGalleryState.items.length;
-        __msRenderGalleryViewer();
+        __msStepGalleryViewer(-1);
       });
       bindBtn('ms-gallery-viewer-next', function() {
-        if (!__msGalleryState.items.length) return;
-        __msGalleryState.index = (__msGalleryState.index + 1) % __msGalleryState.items.length;
-        __msRenderGalleryViewer();
+        __msStepGalleryViewer(1);
       });
       bindBtn('ms-gallery-viewer-delete', function() {
         __msDeleteGalleryPhoto(__msGalleryState.index);
@@ -7549,6 +7659,77 @@ function injectRemoteUiRedesign(win, targetFrame) {
         __gvModal.addEventListener('click', function(ev) {
           if (ev.target === __gvModal) __msCloseGalleryViewer();
         });
+      }
+      var __gvCard = document.getElementById('ms-gallery-viewer-card');
+      if (__gvCard && !__gvCard.dataset.dragBound) {
+        __gvCard.dataset.dragBound = '1';
+        var __gvDrag = null;
+        var __DRAG_THRESHOLD = 45;
+
+        var __gvDragStart = function(x, y, id) {
+          if (!__msGalleryState.items.length) return;
+          __gvDrag = { id: id, x: x, y: y };
+          __gvCard.classList.add('ms-dragging');
+        };
+
+        var __gvDragEnd = function(x, y, id) {
+          if (!__gvDrag) return;
+          if (typeof id !== 'undefined' && id !== null && __gvDrag.id !== id) return;
+          var dx = x - __gvDrag.x;
+          var dy = y - __gvDrag.y;
+          var ax = Math.abs(dx);
+          var ay = Math.abs(dy);
+          __gvCard.classList.remove('ms-dragging');
+          __gvDrag = null;
+          if (ax < __DRAG_THRESHOLD && ay < __DRAG_THRESHOLD) return;
+          if (ax >= ay) __msStepGalleryViewer(dx < 0 ? 1 : -1);
+          else __msStepGalleryViewer(dy < 0 ? 1 : -1);
+        };
+
+        var __gvDragCancel = function() {
+          __gvCard.classList.remove('ms-dragging');
+          __gvDrag = null;
+        };
+
+        if (typeof window.PointerEvent === 'function') {
+          __gvCard.addEventListener('pointerdown', function(ev) {
+            if (ev.button !== 0) return;
+            if (ev.target && ev.target.closest && ev.target.closest('button')) return;
+            ev.preventDefault();
+            __gvDragStart(ev.clientX, ev.clientY, ev.pointerId);
+            try { __gvCard.setPointerCapture(ev.pointerId); } catch (_) {}
+          });
+          __gvCard.addEventListener('pointerup', function(ev) {
+            __gvDragEnd(ev.clientX, ev.clientY, ev.pointerId);
+            try { __gvCard.releasePointerCapture(ev.pointerId); } catch (_) {}
+          });
+          __gvCard.addEventListener('pointercancel', function(ev) {
+            try { __gvCard.releasePointerCapture(ev.pointerId); } catch (_) {}
+            __gvDragCancel();
+          });
+        } else {
+          __gvCard.addEventListener('mousedown', function(ev) {
+            if (ev.button !== 0) return;
+            if (ev.target && ev.target.closest && ev.target.closest('button')) return;
+            ev.preventDefault();
+            __gvDragStart(ev.clientX, ev.clientY, 'mouse');
+          });
+          window.addEventListener('mouseup', function(ev) {
+            __gvDragEnd(ev.clientX, ev.clientY, 'mouse');
+          });
+          __gvCard.addEventListener('touchstart', function(ev) {
+            if (ev.target && ev.target.closest && ev.target.closest('button')) return;
+            if (!ev.touches || !ev.touches.length) return;
+            var t = ev.touches[0];
+            __gvDragStart(t.clientX, t.clientY, 'touch');
+          }, { passive: true });
+          __gvCard.addEventListener('touchend', function(ev) {
+            if (!ev.changedTouches || !ev.changedTouches.length) { __gvDragCancel(); return; }
+            var t = ev.changedTouches[0];
+            __gvDragEnd(t.clientX, t.clientY, 'touch');
+          }, { passive: true });
+          __gvCard.addEventListener('touchcancel', __gvDragCancel, { passive: true });
+        }
       }
       bindBtn('ms-start-btn', function() {
         console.log('[start] click handler entered');
