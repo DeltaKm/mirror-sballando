@@ -1130,6 +1130,8 @@ function injectSessionFrameOverlay(win, targetFrame) {
       }
 
       var __msPreviewFrameProbeCache = Object.create(null);
+      var __msFrameOpaqueProbeCache = Object.create(null);
+      var __msDefaultPreviewRect = { left: 0.0767, top: 0.1094, width: 0.8466, height: 0.7812 };
 
       function __msClamp01(v) {
         var n = Number(v);
@@ -1139,12 +1141,33 @@ function injectSessionFrameOverlay(win, targetFrame) {
         return n;
       }
 
+      function __msNormalizePreviewRect(rect, fallback) {
+        var fb = fallback || __msDefaultPreviewRect;
+        var source = (rect && typeof rect === 'object') ? rect : fb;
+        var width = __msClamp01(source.width);
+        var height = __msClamp01(source.height);
+        if (width <= 0 || height <= 0) {
+          width = __msClamp01(fb.width);
+          height = __msClamp01(fb.height);
+        }
+        // A offset 0 la foto deve risultare centrata sul foglio (orizzontale e
+        // verticale), mantenendo le dimensioni del foro rilevato. Cosi'
+        // calibrazione, live, post-scatto e salvataggio restano allineati.
+        return {
+          left: __msClamp01((1 - width) / 2),
+          top: __msClamp01((1 - height) / 2),
+          width: width,
+          height: height
+        };
+      }
+
       function __msApplyPreviewRectVars(ft, rect) {
         if (!ft || !rect) return;
-        var left = __msClamp01(rect.left);
-        var top = __msClamp01(rect.top);
-        var width = __msClamp01(rect.width);
-        var height = __msClamp01(rect.height);
+        var normalized = __msNormalizePreviewRect(rect, __msDefaultPreviewRect);
+        var left = normalized.left;
+        var top = normalized.top;
+        var width = normalized.width;
+        var height = normalized.height;
         ft.style.setProperty('--ms-photo-left', String(left), 'important');
         ft.style.setProperty('--ms-photo-top', String(top), 'important');
         ft.style.setProperty('--ms-photo-w', String(width), 'important');
@@ -1177,6 +1200,129 @@ function injectSessionFrameOverlay(win, targetFrame) {
           if (!gx) return null;
           gx.drawImage(img, 0, 0, w, h);
           var data = gx.getImageData(0, 0, w, h).data;
+
+          function componentScan(alphaMax) {
+            var total = w * h;
+            var seen = new Uint8Array(total);
+            var qx = new Int32Array(total);
+            var qy = new Int32Array(total);
+            var best = null;
+
+            for (var sy = 0; sy < h; sy++) {
+              for (var sx = 0; sx < w; sx++) {
+                var startIdx = sy * w + sx;
+                if (seen[startIdx] || data[startIdx * 4 + 3] > alphaMax) continue;
+
+                var head = 0;
+                var tail = 0;
+                var minX = sx;
+                var maxX = sx;
+                var minY = sy;
+                var maxY = sy;
+                var count = 0;
+                var touchesBorder = false;
+                var rowMin = Object.create(null);
+                var rowMax = Object.create(null);
+                var rowCount = Object.create(null);
+                var colMin = Object.create(null);
+                var colMax = Object.create(null);
+                var colCount = Object.create(null);
+
+                seen[startIdx] = 1;
+                qx[tail] = sx;
+                qy[tail] = sy;
+                tail++;
+
+                while (head < tail) {
+                  var x0 = qx[head];
+                  var y0 = qy[head];
+                  head++;
+                  count++;
+                  if (x0 < minX) minX = x0;
+                  if (x0 > maxX) maxX = x0;
+                  if (y0 < minY) minY = y0;
+                  if (y0 > maxY) maxY = y0;
+                  if (x0 === 0 || y0 === 0 || x0 === w - 1 || y0 === h - 1) touchesBorder = true;
+                  if (rowCount[y0] === undefined) { rowCount[y0] = 0; rowMin[y0] = x0; rowMax[y0] = x0; }
+                  rowCount[y0]++;
+                  if (x0 < rowMin[y0]) rowMin[y0] = x0;
+                  if (x0 > rowMax[y0]) rowMax[y0] = x0;
+                  if (colCount[x0] === undefined) { colCount[x0] = 0; colMin[x0] = y0; colMax[x0] = y0; }
+                  colCount[x0]++;
+                  if (y0 < colMin[x0]) colMin[x0] = y0;
+                  if (y0 > colMax[x0]) colMax[x0] = y0;
+
+                  var nx, ny, ni;
+                  nx = x0 + 1; ny = y0;
+                  if (nx < w) {
+                    ni = ny * w + nx;
+                    if (!seen[ni] && data[ni * 4 + 3] <= alphaMax) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+                  }
+                  nx = x0 - 1; ny = y0;
+                  if (nx >= 0) {
+                    ni = ny * w + nx;
+                    if (!seen[ni] && data[ni * 4 + 3] <= alphaMax) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+                  }
+                  nx = x0; ny = y0 + 1;
+                  if (ny < h) {
+                    ni = ny * w + nx;
+                    if (!seen[ni] && data[ni * 4 + 3] <= alphaMax) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+                  }
+                  nx = x0; ny = y0 - 1;
+                  if (ny >= 0) {
+                    ni = ny * w + nx;
+                    if (!seen[ni] && data[ni * 4 + 3] <= alphaMax) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+                  }
+                }
+
+                var relW = (maxX - minX + 1) / w;
+                var relH = (maxY - minY + 1) / h;
+                if (touchesBorder || relW < 0.30 || relH < 0.30 || relW > 0.98 || relH > 0.98) continue;
+                if (!best || count > best.count) {
+                  var median = function(values) {
+                    values.sort(function(a, b) { return a - b; });
+                    var mid = Math.floor(values.length / 2);
+                    return values.length % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+                  };
+                  var rowLefts = [];
+                  var rowRights = [];
+                  var minRowPixels = Math.max(12, Math.round(w * 0.04));
+                  Object.keys(rowCount).forEach(function(k) {
+                    if (rowCount[k] >= minRowPixels) {
+                      rowLefts.push(rowMin[k]);
+                      rowRights.push(rowMax[k]);
+                    }
+                  });
+                  var colTops = [];
+                  var colBottoms = [];
+                  var minColPixels = Math.max(12, Math.round(h * 0.04));
+                  Object.keys(colCount).forEach(function(k) {
+                    if (colCount[k] >= minColPixels) {
+                      colTops.push(colMin[k]);
+                      colBottoms.push(colMax[k]);
+                    }
+                  });
+                  if (rowLefts.length >= 8 && colTops.length >= 8) {
+                    minX = Math.round(median(rowLefts));
+                    maxX = Math.round(median(rowRights));
+                    minY = Math.round(median(colTops));
+                    maxY = Math.round(median(colBottoms));
+                  }
+                  best = { count: count, minX: minX, maxX: maxX, minY: minY, maxY: maxY };
+                }
+              }
+            }
+
+            if (!best) return null;
+            var padX = 1 / w;
+            var padY = 1 / h;
+            var left = __msClamp01(best.minX / w + padX);
+            var top = __msClamp01(best.minY / h + padY);
+            var width = __msClamp01((best.maxX - best.minX + 1) / w - padX * 2);
+            var height = __msClamp01((best.maxY - best.minY + 1) / h - padY * 2);
+            if (width < 0.30 || height < 0.30) return null;
+            return { left: left, top: top, width: width, height: height };
+          }
 
           function scan(alphaMax) {
             var rowCounts = new Array(h);
@@ -1249,10 +1395,108 @@ function injectSessionFrameOverlay(win, targetFrame) {
             return { left: left, top: top, width: width, height: height };
           }
 
-          return scan(8) || scan(20) || scan(36) || null;
+          return componentScan(8) || componentScan(20) || componentScan(36) || scan(8) || scan(20) || scan(36) || null;
         } catch (_) {
           return null;
         }
+      }
+
+      function __msComputeOpaqueRectFromImage(img) {
+        try {
+          var nw = img && (img.naturalWidth || img.width) || 0;
+          var nh = img && (img.naturalHeight || img.height) || 0;
+          if (!nw || !nh) return null;
+
+          var maxSide = 900;
+          var scale = Math.min(1, maxSide / Math.max(nw, nh));
+          var w = Math.max(1, Math.round(nw * scale));
+          var h = Math.max(1, Math.round(nh * scale));
+
+          var cv = document.createElement('canvas');
+          cv.width = w;
+          cv.height = h;
+          var gx = cv.getContext('2d', { willReadFrequently: true }) || cv.getContext('2d');
+          if (!gx) return null;
+          gx.drawImage(img, 0, 0, w, h);
+          var data = gx.getImageData(0, 0, w, h).data;
+
+          var minX = w, minY = h, maxX = -1, maxY = -1;
+          for (var y = 0; y < h; y++) {
+            var row = y * w * 4;
+            for (var x = 0; x < w; x++) {
+              var a = data[row + x * 4 + 3];
+              if (a > 8) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }
+            }
+          }
+          if (maxX <= minX || maxY <= minY) return null;
+
+          var left = __msClamp01(minX / w);
+          var top = __msClamp01(minY / h);
+          var width = __msClamp01((maxX - minX + 1) / w);
+          var height = __msClamp01((maxY - minY + 1) / h);
+          if (width < 0.3 || height < 0.3) return null;
+          return { left: left, top: top, width: width, height: height };
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function __msApplyOpaqueRectVars(ft, rect) {
+        if (!ft || !rect) return;
+        ft.style.setProperty('--ms-frame-left', String(__msClamp01(rect.left)), 'important');
+        ft.style.setProperty('--ms-frame-top', String(__msClamp01(rect.top)), 'important');
+        ft.style.setProperty('--ms-frame-w', String(__msClamp01(rect.width)), 'important');
+        ft.style.setProperty('--ms-frame-h', String(__msClamp01(rect.height)), 'important');
+      }
+
+      function __msResetOpaqueRectVars(ft) {
+        if (!ft) return;
+        try { ft.style.removeProperty('--ms-frame-left'); } catch (_) {}
+        try { ft.style.removeProperty('--ms-frame-top'); } catch (_) {}
+        try { ft.style.removeProperty('--ms-frame-w'); } catch (_) {}
+        try { ft.style.removeProperty('--ms-frame-h'); } catch (_) {}
+      }
+
+      function __msEnsureOpaqueRect(ft, frameSrc) {
+        if (!ft) return;
+        var src = String(frameSrc || '').trim();
+        if (!src) {
+          __msResetOpaqueRectVars(ft);
+          try { ft.__msOpaqueRectSrc = ''; } catch (_) {}
+          return;
+        }
+
+        var cached = __msFrameOpaqueProbeCache[src];
+        if (cached && cached.done) {
+          if (cached.rect) __msApplyOpaqueRectVars(ft, cached.rect);
+          else __msResetOpaqueRectVars(ft);
+          return;
+        }
+        if (cached && !cached.done) return;
+
+        __msFrameOpaqueProbeCache[src] = { done: false, rect: null };
+        var probe = new Image();
+        try { probe.crossOrigin = 'anonymous'; } catch (_) {}
+        probe.onload = function() {
+          var rect = __msComputeOpaqueRectFromImage(probe);
+          __msFrameOpaqueProbeCache[src] = { done: true, rect: rect };
+          if (!ft || !ft.isConnected) return;
+          if (String(ft.__msOpaqueRectSrc || '') !== src) return;
+          if (rect) __msApplyOpaqueRectVars(ft, rect);
+          else __msResetOpaqueRectVars(ft);
+        };
+        probe.onerror = function() {
+          __msFrameOpaqueProbeCache[src] = { done: true, rect: null };
+          if (!ft || !ft.isConnected) return;
+          if (String(ft.__msOpaqueRectSrc || '') !== src) return;
+          __msResetOpaqueRectVars(ft);
+        };
+        probe.src = src;
       }
 
       function __msEnsurePreviewRect(ft, frameSrc) {
@@ -1277,12 +1521,11 @@ function injectSessionFrameOverlay(win, targetFrame) {
         var probe = new Image();
         try { probe.crossOrigin = 'anonymous'; } catch (_) {}
         probe.onload = function() {
-          var rect = __msComputeTransparentRectFromImage(probe);
+          var rect = __msNormalizePreviewRect(__msComputeTransparentRectFromImage(probe), __msDefaultPreviewRect);
           __msPreviewFrameProbeCache[src] = { done: true, rect: rect };
           if (!ft || !ft.isConnected) return;
           if (String(ft.__msPreviewRectSrc || '') !== src) return;
-          if (rect) __msApplyPreviewRectVars(ft, rect);
-          else __msResetPreviewRectVars(ft);
+          __msApplyPreviewRectVars(ft, rect);
         };
         probe.onerror = function() {
           __msPreviewFrameProbeCache[src] = { done: true, rect: null };
@@ -1291,6 +1534,31 @@ function injectSessionFrameOverlay(win, targetFrame) {
           __msResetPreviewRectVars(ft);
         };
         probe.src = src;
+      }
+
+      function __msGetPreviewRectForSource(frameSrc) {
+        try {
+          var src = String(frameSrc || '').trim();
+          if (!src) return null;
+          var cached = __msPreviewFrameProbeCache[src];
+          if (cached && cached.done) return __msNormalizePreviewRect(cached.rect, __msDefaultPreviewRect);
+          if (!cached) {
+            __msPreviewFrameProbeCache[src] = { done: false, rect: null };
+            var probe = new Image();
+            try { probe.crossOrigin = 'anonymous'; } catch (_) {}
+            probe.onload = function() {
+              var rect = __msNormalizePreviewRect(__msComputeTransparentRectFromImage(probe), __msDefaultPreviewRect);
+              __msPreviewFrameProbeCache[src] = { done: true, rect: rect };
+              try { if (typeof window._msSessionFrameLiteSync === 'function') window._msSessionFrameLiteSync(); } catch (_) {}
+              try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
+            };
+            probe.onerror = function() {
+              __msPreviewFrameProbeCache[src] = { done: true, rect: null };
+            };
+            probe.src = src;
+          }
+        } catch (_) {}
+        return __msNormalizePreviewRect(null, __msDefaultPreviewRect);
       }
 
       function isSession() {
@@ -1371,6 +1639,91 @@ function injectSessionFrameOverlay(win, targetFrame) {
           try { console.log('[ms] cornice creata parent=' + (ov.parentNode && ov.parentNode.tagName) + (ov.parentNode && ov.parentNode.id ? '#' + ov.parentNode.id : '')); } catch (_) {}
         }
         return ov;
+      }
+
+      function ensureWhiteMasks() {
+        var root = getPreferredParent() || document.documentElement || document.body;
+        var ids = ['top', 'right', 'bottom', 'left'];
+        var out = {};
+        for (var i = 0; i < ids.length; i++) {
+          var k = ids[i];
+          var id = 'ms-session-white-mask-' + k;
+          var el = document.getElementById(id);
+          if (!el) {
+            el = document.createElement('div');
+            el.id = id;
+            el.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;background:#000000;pointer-events:none;display:none;margin:0;padding:0;border:0;';
+            el.style.setProperty('z-index', '2147483645', 'important');
+            root.appendChild(el);
+          } else if (root && el.parentNode !== root) {
+            root.appendChild(el);
+          }
+          el.style.setProperty('background', '#000000', 'important');
+          out[k] = el;
+        }
+        return out;
+      }
+
+      function hideWhiteMasks() {
+        ['top', 'right', 'bottom', 'left'].forEach(function(k) {
+          var el = document.getElementById('ms-session-white-mask-' + k);
+          if (el) el.style.setProperty('display', 'none', 'important');
+        });
+      }
+
+      function ensureBlackBackdrop() {
+        var root = getPreferredParent() || document.documentElement || document.body;
+        var el = document.getElementById('ms-session-black-backdrop');
+        if (!el) {
+          el = document.createElement('div');
+          el.id = 'ms-session-black-backdrop';
+          el.style.cssText = 'position:fixed;inset:0;background:#000000;pointer-events:none;display:none;margin:0;padding:0;border:0;';
+          el.style.setProperty('z-index', '2147483643', 'important');
+          root.appendChild(el);
+        } else if (root && el.parentNode !== root) {
+          root.appendChild(el);
+        }
+        el.style.setProperty('position', 'fixed', 'important');
+        el.style.setProperty('inset', '0', 'important');
+        el.style.setProperty('background', '#000000', 'important');
+        el.style.setProperty('display', 'block', 'important');
+        el.style.setProperty('z-index', '2147483643', 'important');
+        return el;
+      }
+
+      function hideBlackBackdrop() {
+        var el = document.getElementById('ms-session-black-backdrop');
+        if (el) el.style.setProperty('display', 'none', 'important');
+      }
+
+      function resolveFrameCalibration() {
+        try {
+          var clampNum = function(v, min, max, fb) {
+            var n = parseFloat(v);
+            if (!isFinite(n)) n = fb;
+            return Math.max(min, Math.min(max, Math.round(n * 10) / 10));
+          };
+          var selected = '';
+          try { selected = String(localStorage.getItem(SELECTED_KEY) || ''); } catch (_) {}
+          var frameKey = 'postcard::' + selected;
+          var framePresets = {};
+          var presets = {};
+          try { framePresets = JSON.parse(localStorage.getItem('ms-cal-frame-presets-v1') || '{}') || {}; } catch (_) { framePresets = {}; }
+          try { presets = JSON.parse(localStorage.getItem('ms-cal-presets-v1') || '{}') || {}; } catch (_) { presets = {}; }
+          var byFrame = selected ? framePresets[frameKey] : null;
+          var base = (byFrame && typeof byFrame === 'object') ? byFrame : (presets.postcard || null);
+          if (!base || typeof base !== 'object') base = { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
+          return {
+            offsetXmm: clampNum(base.offsetXmm, -5, 5, 0),
+            offsetYmm: clampNum(base.offsetYmm, -5, 5, 0),
+            zoomPct: clampNum(base.zoomPct, 80, 120, 100),
+            photoOffsetXmm: clampNum(base.photoOffsetXmm, -5, 5, 0),
+            photoOffsetYmm: clampNum(base.photoOffsetYmm, -5, 5, 0),
+            photoZoomPct: clampNum(base.photoZoomPct, 80, 120, 100)
+          };
+        } catch (_) {
+          return { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
+        }
       }
 
       function setFsBtnIcon(btn, isFs) {
@@ -1499,6 +1852,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
             }
           } catch (_) {}
           if (!show) {
+            var __duringCountdown = !!window.__msCountdownActive;
             var __old = document.getElementById('ms-live-bar');
             if (__old && __old.parentNode) __old.parentNode.removeChild(__old);
             var __oldHint = document.getElementById('ms-lv-hint');
@@ -1509,6 +1863,12 @@ function injectSessionFrameOverlay(win, targetFrame) {
             if (__oldCam && __oldCam.parentNode) __oldCam.parentNode.removeChild(__oldCam);
             var __oldVig = document.getElementById('ms-lv-vignette');
             if (__oldVig && __oldVig.parentNode) __oldVig.parentNode.removeChild(__oldVig);
+            var __oldColPanel = document.getElementById('ms-lv-collage-panel');
+            if (__oldColPanel && __oldColPanel.parentNode) __oldColPanel.parentNode.removeChild(__oldColPanel);
+            var __oldGrid = document.getElementById('ms-lv-grid');
+            if (__oldGrid && __oldGrid.parentNode) __oldGrid.parentNode.removeChild(__oldGrid);
+            var __oldLp = document.getElementById('ms-lv-layout-preview');
+            if (!__duringCountdown && __oldLp && __oldLp.parentNode) __oldLp.parentNode.removeChild(__oldLp);
             // NON rimuoviamo mai #ms-countdown-overlay qui: il countdown ha
             // un ciclo di vita autonomo (auto-remove al termine). Se la live
             // action bar viene nascosta mentre il countdown e' in corso,
@@ -1673,6 +2033,93 @@ function injectSessionFrameOverlay(win, targetFrame) {
               '@keyframes msCdFlash{0%{background:rgba(255,255,255,0.98);}100%{background:rgba(255,255,255,0);opacity:0;}}';
             (document.head || document.documentElement).appendChild(__css);
           }
+          // ── Collage / layout panel + griglia 2x2 (style "Stories") ──
+          if (!document.getElementById('ms-lv-collage-css')) {
+            var __ccss = document.createElement('style');
+            __ccss.id = 'ms-lv-collage-css';
+            __ccss.textContent =
+              // Griglia live disattivata (richiesta UI pulita senza separatori)
+              '#ms-lv-grid{display:none !important;}' +
+              // Pannello layout: bottone in alto a destra con tendina opzioni.
+              '#ms-lv-collage-panel{position:fixed;right:24px;top:92px;z-index:2147483647;' +
+              'display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:8px;' +
+              'border-radius:18px;background:rgba(14,14,20,0.50);' +
+              'backdrop-filter:blur(28px) saturate(160%);-webkit-backdrop-filter:blur(28px) saturate(160%);' +
+              'border:1px solid rgba(255,255,255,0.10);' +
+              'box-shadow:0 18px 50px rgba(0,0,0,0.55),inset 0 1px 0 rgba(255,255,255,0.08);' +
+              'animation:msColPanelIn 0.45s cubic-bezier(.22,1.2,.36,1) both;}' +
+              '@keyframes msColPanelIn{0%{opacity:0;transform:translateY(-10px);}100%{opacity:1;transform:translateY(0);}}' +
+              '#ms-lv-collage-panel .ms-col-title{height:62px;border-radius:18px;padding:0 22px;border:1px solid rgba(255,255,255,0.14);' +
+              'display:inline-flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;background:rgba(255,255,255,0.08);' +
+              'font-size:15px;font-weight:800;letter-spacing:2.5px;color:rgba(255,255,255,0.92);' +
+              'text-transform:uppercase;margin:0;text-align:center;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter","Segoe UI",Roboto,sans-serif;}' +
+              '#ms-lv-collage-panel .ms-col-title::after{content:"";width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:8px solid currentColor;opacity:0.72;transition:transform 0.18s;}' +
+              '#ms-lv-collage-panel.is-open .ms-col-title::after{transform:rotate(180deg);}' +
+              '#ms-lv-collage-panel .ms-col-btn{position:relative;width:68px;height:68px;border-radius:18px;cursor:pointer;' +
+              'display:none;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,0.14);' +
+              'background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.92);' +
+              'transition:transform 0.18s cubic-bezier(.22,1.2,.36,1),background 0.2s,border-color 0.2s;outline:none;' +
+              '-webkit-user-select:none;user-select:none;}' +
+              '#ms-lv-collage-panel.is-open .ms-col-btn{display:inline-flex;}' +
+              '#ms-lv-collage-panel .ms-col-btn:hover{transform:scale(1.06);background:rgba(255,255,255,0.12);border-color:rgba(255,255,255,0.28);}' +
+              '#ms-lv-collage-panel .ms-col-btn.is-active{background:#ffffff;border-color:#ffffff;color:#0a0a0a;' +
+              'box-shadow:0 8px 22px rgba(255,255,255,0.18),inset 0 0 0 1px rgba(0,0,0,0.04);}' +
+              '#ms-lv-collage-panel .ms-col-btn.is-active svg{stroke:#0a0a0a;}' +
+              '#ms-lv-collage-panel .ms-col-btn svg{width:36px;height:36px;stroke:currentColor;fill:none;stroke-width:1.8;}' +
+              // Indicatore progresso scatto (in alto al centro durante la sequenza)
+              '#ms-lv-collage-progress{position:fixed;top:32px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+              'display:flex;gap:8px;padding:8px 14px;border-radius:999px;background:rgba(14,14,20,0.55);' +
+              'backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);' +
+              'border:1px solid rgba(255,255,255,0.12);box-shadow:0 10px 30px rgba(0,0,0,0.45);' +
+              'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter","Segoe UI",Roboto,sans-serif;' +
+              'animation:msColProgIn 0.3s ease-out both;}' +
+              '@keyframes msColProgIn{0%{opacity:0;transform:translate(-50%,-12px);}100%{opacity:1;transform:translate(-50%,0);}}' +
+              '#ms-lv-collage-progress .ms-col-prog-dot{width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,0.22);' +
+              'transition:background 0.25s,transform 0.25s;}' +
+              '#ms-lv-collage-progress .ms-col-prog-dot.done{background:#22c55e;transform:scale(1.1);}' +
+              '#ms-lv-collage-progress .ms-col-prog-dot.cur{background:#fff;transform:scale(1.25);' +
+              'box-shadow:0 0 0 3px rgba(255,255,255,0.20);}' +
+              // Overlay anteprima layout: celle posizionate sulla preview
+              '#ms-lv-layout-preview{position:fixed;inset:0;z-index:2147483644;pointer-events:none;' +
+              'display:flex;align-items:center;justify-content:center;}' +
+              '#ms-lv-layout-preview .ms-lp-sheet{position:relative;aspect-ratio:2/3;height:96vh;max-width:96vw;width:auto;}' +
+              '#ms-lv-layout-preview .ms-lp-backdrop{position:absolute;inset:0;' +
+              'background-color:#0b0b12;}' +
+              '#ms-lv-layout-preview .ms-lp-cell{position:absolute;box-sizing:border-box;border-radius:10px;' +
+              'border:2px solid rgba(255,255,255,0.52);background:rgba(255,255,255,0.04);' +
+              'transition:background 0.25s,box-shadow 0.25s,opacity 0.25s;overflow:hidden;}' +
+              '#ms-lv-layout-preview .ms-lp-logo{position:absolute;inset:0;z-index:1;pointer-events:none;' +
+              'display:flex;align-items:center;justify-content:center;}' +
+              '#ms-lv-layout-preview .ms-lp-logo-img{max-width:78%;max-height:78%;width:auto;height:auto;' +
+              'object-fit:contain;opacity:0.26;}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="active"]{' +
+              'border-color:rgba(255,255,255,0.98);' +
+              'box-shadow:inset 0 0 0 2px rgba(255,255,255,0.40),0 0 30px rgba(255,255,255,0.26);' +
+              'background:rgba(255,255,255,0.06);animation:msLpPulse 1.6s ease-in-out infinite;}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="done"]{' +
+              'border-color:rgba(34,197,94,0.70);box-shadow:inset 0 0 0 1px rgba(34,197,94,0.45);background:rgba(0,0,0,0.10);}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="idle"]{opacity:0.94;}' +
+              '#ms-lv-layout-preview .ms-lp-num{position:absolute;top:8px;left:8px;padding:3px 8px;border-radius:999px;' +
+              'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter","Segoe UI",Roboto,sans-serif;' +
+              'font-size:11px;font-weight:800;letter-spacing:1.2px;color:#fff;background:rgba(0,0,0,0.55);' +
+              'border:1px solid rgba(255,255,255,0.20);text-shadow:0 1px 4px rgba(0,0,0,0.7);}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="active"] .ms-lp-num{background:#ffffff;color:#0a0a0a;border-color:#fff;}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="done"] .ms-lp-num{background:rgba(34,197,94,0.92);color:#06140a;border-color:rgba(34,197,94,0.8);}' +
+              '#ms-lv-layout-preview .ms-lp-thumb{position:absolute;inset:0;z-index:2;width:100%;height:100%;object-fit:cover;opacity:0.95;}' +
+              '#ms-lv-layout-preview .ms-lp-live-canvas{position:absolute;inset:0;z-index:2;width:100%;height:100%;pointer-events:none;background:#000;}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="idle"]{background:rgba(0,0,0,0.55);}' +
+              '#ms-lv-layout-preview .ms-lp-cell[data-state="active"] .ms-lp-live-canvas{filter:brightness(1.02) saturate(1.05);}' +
+              '#ms-lv-layout-preview .ms-lp-bigshot{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);' +
+              'padding:8px 18px;border-radius:999px;background:rgba(255,255,255,0.96);color:#0a0a0a;' +
+              'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter","Segoe UI",Roboto,sans-serif;' +
+              'font-size:18px;font-weight:800;letter-spacing:0.6px;' +
+              'box-shadow:0 10px 28px rgba(0,0,0,0.45),0 0 0 1px rgba(0,0,0,0.06);' +
+              'white-space:nowrap;animation:msLpBigIn 0.4s cubic-bezier(.22,1.2,.36,1) both;}' +
+              '@keyframes msLpBigIn{0%{opacity:0;transform:translate(-50%,8px);}100%{opacity:1;transform:translate(-50%,0);}}' +
+              '@keyframes msLpPulse{0%,100%{box-shadow:0 0 0 3px rgba(255,255,255,0.18),0 0 28px rgba(255,255,255,0.30);}50%{box-shadow:0 0 0 5px rgba(255,255,255,0.10),0 0 42px rgba(255,255,255,0.18);}}' +
+              '';
+            (document.head || document.documentElement).appendChild(__ccss);
+          }
           // Vignetta cinematica
           if (!document.getElementById('ms-lv-vignette')) {
             var vig = document.createElement('div');
@@ -1768,9 +2215,734 @@ function injectSessionFrameOverlay(win, targetFrame) {
             };
             document.getElementById('ms-lv-prev').addEventListener('click', function(ev) { ev.preventDefault(); ev.stopPropagation(); cycleLocal(-1); });
             document.getElementById('ms-lv-next').addEventListener('click', function(ev) { ev.preventDefault(); ev.stopPropagation(); cycleLocal(1); });
+            // ── COLLAGE: definizioni & pannello layout (idempotenti, su window) ──
+            if (!window.__msCollageInited) {
+              window.__msCollageInited = true;
+              window.__MS_COLLAGE_LAYOUTS = {
+                '1':      [{x:0,y:0,w:1200,h:1800}],
+                '2v':     [{x:0,y:0,w:1200,h:900},{x:0,y:900,w:1200,h:900}],
+                '2h':     [{x:0,y:0,w:600,h:1800},{x:600,y:0,w:600,h:1800}],
+                '4':      [{x:0,y:0,w:600,h:900},{x:600,y:0,w:600,h:900},{x:0,y:900,w:600,h:900},{x:600,y:900,w:600,h:900}],
+                'strip3': [{x:0,y:0,w:1200,h:600},{x:0,y:600,w:1200,h:600},{x:0,y:1200,w:1200,h:600}]
+              };
+              window.__msGetCollageLayout = function() {
+                try {
+                  var v = String(localStorage.getItem('msCollageLayoutV1') || '').trim();
+                  if (v && window.__MS_COLLAGE_LAYOUTS[v]) return v;
+                } catch (_) {}
+                return '1';
+              };
+              window.__msSetCollageLayout = function(k) {
+                try { if (window.__MS_COLLAGE_LAYOUTS[k]) localStorage.setItem('msCollageLayoutV1', k); } catch (_) {}
+              };
+              window.__msDrawSlot = function(ctx, video, slot, gap) {
+                gap = gap || 0;
+                var x = slot.x + gap, y = slot.y + gap;
+                var w = slot.w - gap * 2, h = slot.h - gap * 2;
+                if (w <= 0 || h <= 0) return;
+                var vw = video && video.videoWidth | 0;
+                var vh = video && video.videoHeight | 0;
+                if (!vw || !vh) return;
+                var slotAR = w / h, vAR = vw / vh;
+                var sx = 0, sy = 0, sw = vw, sh = vh;
+                if (vAR > slotAR) { sw = vh * slotAR; sx = (vw - sw) / 2; }
+                else if (vAR < slotAR) { sh = vw / slotAR; sy = (vh - sh) / 2; }
+                ctx.save();
+                ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+                ctx.translate(x + w, y); ctx.scale(-1, 1); // mirror selfie
+                ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+                ctx.restore();
+              };
+              // Face detector singleton (Shape Detection API)
+              window.__msGetFaceDetector = function() {
+                try {
+                  if (window.__msFaceDetector === undefined) {
+                    if (typeof window.FaceDetector === 'function') {
+                      try {
+                        window.__msFaceDetector = new window.FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+                      } catch (e) {
+                        window.__msFaceDetector = null;
+                        console.log('[ms] FaceDetector ctor failed: ' + (e && e.message));
+                      }
+                    } else {
+                      window.__msFaceDetector = null;
+                      console.log('[ms] FaceDetector API non disponibile (fallback luma)');
+                    }
+                  }
+                  return window.__msFaceDetector;
+                } catch (_) { return null; }
+              };
+              // Restituisce la bbox del viso in coordinate del SOURCE video (px), o null
+              window.__msDetectFaceBBox = function(video) {
+                return new Promise(function(resolve) {
+                  try {
+                    var det = window.__msGetFaceDetector();
+                    if (!det || !video || !video.videoWidth) { resolve(null); return; }
+                    // Per performance/affidabilità: scalo a max 640px lato lungo
+                    var vw = video.videoWidth | 0, vh = video.videoHeight | 0;
+                    var maxSide = 640;
+                    var scale = Math.min(1, maxSide / Math.max(vw, vh));
+                    var dw = Math.max(64, Math.round(vw * scale));
+                    var dh = Math.max(64, Math.round(vh * scale));
+                    var c = document.createElement('canvas');
+                    c.width = dw; c.height = dh;
+                    var cx = c.getContext('2d');
+                    cx.drawImage(video, 0, 0, dw, dh);
+                    var t0 = Date.now();
+                    det.detect(c).then(function(faces) {
+                      if (!faces || !faces.length) { resolve(null); return; }
+                      // Prendo la faccia più grande
+                      var best = null;
+                      for (var i = 0; i < faces.length; i++) {
+                        var b = faces[i].boundingBox;
+                        if (!b) continue;
+                        if (!best || (b.width * b.height) > (best.width * best.height)) best = b;
+                      }
+                      if (!best) { resolve(null); return; }
+                      // Riconverto in coordinate sorgente
+                      var invS = 1 / scale;
+                      var out = {
+                        x: best.x * invS,
+                        y: best.y * invS,
+                        w: best.width * invS,
+                        h: best.height * invS,
+                        cx: (best.x + best.width / 2) * invS,
+                        cy: (best.y + best.height / 2) * invS,
+                        detMs: Date.now() - t0
+                      };
+                      resolve(out);
+                    }).catch(function(e) {
+                      console.log('[ms] face detect err: ' + (e && e.message));
+                      resolve(null);
+                    });
+                  } catch (e) { resolve(null); }
+                });
+              };
+              // Calcola un crop di sorgente per replicare l'inquadratura del primo scatto:
+              // mantiene la stessa scala del volto e la stessa posizione relativa al crop.
+              window.__msFaceAlignCrop = function(fixedCrop, refFace, curFace) {
+                try {
+                  if (!fixedCrop || !refFace || !curFace || !refFace.w || !curFace.w) return null;
+                  // Compensazione scala: se la persona si avvicina/allontana dalla camera il viso
+                  // appare più grande/piccolo nel video. Adeguiamo le dimensioni del crop in modo
+                  // che il viso occupi la stessa porzione del frame in tutti gli scatti.
+                  // s = curFace.w / refFace.w: se il viso è cresciuto del 20% → crop più grande del 20%
+                  // così la persona appare con lo stesso zoom del primo scatto.
+                  var s = (refFace.w > 10 && curFace.w > 10)
+                    ? Math.max(0.75, Math.min(1.33, curFace.w / refFace.w))
+                    : 1.0;
+                  var sw = fixedCrop.sw * s;
+                  var sh = fixedCrop.sh * s;
+                  // Se il crop scalato supererebbe i bordi del video, annulla la correzione
+                  if (sw > fixedCrop.vw || sh > fixedCrop.vh) return null;
+                  // Posizione relativa del volto rispetto al centro del fixedCrop nel primo scatto
+                  var refOffX = refFace.cx - (fixedCrop.sx + fixedCrop.sw / 2);
+                  var refOffY = refFace.cy - (fixedCrop.sy + fixedCrop.sh / 2);
+                  // Centro il crop in modo che il viso attuale finisca alla stessa posizione
+                  // relativa che aveva nel primo scatto (offset scalato con s)
+                  var sx = curFace.cx - sw / 2 - refOffX * s;
+                  var sy = curFace.cy - sh / 2 - refOffY * s;
+                  // Clamp dentro al video
+                  sx = Math.max(0, Math.min(fixedCrop.vw - sw, sx));
+                  sy = Math.max(0, Math.min(fixedCrop.vh - sh, sy));
+                  return {
+                    sx: sx, sy: sy, sw: sw, sh: sh,
+                    vw: fixedCrop.vw, vh: fixedCrop.vh, slotAR: fixedCrop.slotAR,
+                    scale: s
+                  };
+                } catch (_) { return null; }
+              };
+              window.__msComputeFixedCrop = function(video, slot) {
+                try {
+                  var vw = video && video.videoWidth | 0;
+                  var vh = video && video.videoHeight | 0;
+                  if (!vw || !vh || !slot || !slot.w || !slot.h) return null;
+                  var slotAR = slot.w / slot.h;
+                  var vAR = vw / vh;
+                  var sx = 0, sy = 0, sw = vw, sh = vh;
+                  if (vAR > slotAR) { sw = vh * slotAR; sx = (vw - sw) / 2; }
+                  else if (vAR < slotAR) { sh = vw / slotAR; sy = (vh - sh) / 2; }
+                  return { sx: sx, sy: sy, sw: sw, sh: sh, vw: vw, vh: vh, slotAR: slotAR };
+                } catch (_) { return null; }
+              };
+              window.__msBuildCropLuma = function(video, crop, outW, outH) {
+                try {
+                  var vw = video && video.videoWidth | 0;
+                  var vh = video && video.videoHeight | 0;
+                  if (!vw || !vh || !crop) return null;
+                  var w = Math.max(32, outW | 0), h = Math.max(24, outH | 0);
+                  var c = document.createElement('canvas');
+                  c.width = w; c.height = h;
+                  var cx = c.getContext('2d', { willReadFrequently: true });
+                  cx.drawImage(video, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, w, h);
+                  var img = cx.getImageData(0, 0, w, h).data;
+                  var g = new Uint8Array(w * h);
+                  for (var i = 0, j = 0; i < img.length; i += 4, j++) {
+                    g[j] = (img[i] * 0.299 + img[i + 1] * 0.587 + img[i + 2] * 0.114) | 0;
+                  }
+                  return { w: w, h: h, g: g };
+                } catch (_) { return null; }
+              };
+              window.__msEstimateShift = function(refLuma, curLuma, maxShift) {
+                try {
+                  if (!refLuma || !curLuma) return { dx: 0, dy: 0, score: 1e18 };
+                  var w = refLuma.w | 0, h = refLuma.h | 0;
+                  if (!w || !h || w !== (curLuma.w | 0) || h !== (curLuma.h | 0)) return { dx: 0, dy: 0, score: 1e18 };
+                  var rg = refLuma.g, cg = curLuma.g;
+                  var lim = Math.max(0, maxShift | 0);
+                  var best = { dx: 0, dy: 0, score: 1e18 };
+                  var step = 2;
+                  for (var dy = -lim; dy <= lim; dy += step) {
+                    for (var dx = -lim; dx <= lim; dx += step) {
+                      var sad = 0;
+                      var cnt = 0;
+                      for (var y = 4; y < h - 4; y += 4) {
+                        if (y > h * 0.30 && y < h * 0.70) continue;
+                        var y2 = y + dy;
+                        if (y2 < 0 || y2 >= h) continue;
+                        for (var x = 4; x < w - 4; x += 4) {
+                          if (x > w * 0.30 && x < w * 0.70) continue;
+                          var x2 = x + dx;
+                          if (x2 < 0 || x2 >= w) continue;
+                          var i1 = y * w + x;
+                          var i2 = y2 * w + x2;
+                          var d = rg[i1] - cg[i2];
+                          sad += d < 0 ? -d : d;
+                          cnt++;
+                        }
+                      }
+                      if (!cnt) continue;
+                      var score = sad / cnt;
+                      if (score < best.score) best = { dx: dx, dy: dy, score: score };
+                    }
+                  }
+                  return best;
+                } catch (_) { return { dx: 0, dy: 0, score: 1e18 }; }
+              };
+              // Stima scala + traslazione tra frame ref e frame corrente analizzando solo i bordi
+              // (esclude la regione centrale dove c'è il soggetto). Ritorna il crop sorgente
+              // (sx,sy,sw,sh) da usare per riportare l'inquadratura uguale al primo scatto.
+              window.__msEstimateAffineCrop = function(video, fixedCrop, refLuma) {
+                try {
+                  if (!video || !fixedCrop || !refLuma) return null;
+                  var vw = video.videoWidth | 0, vh = video.videoHeight | 0;
+                  if (!vw || !vh) return null;
+                  // LOCK SCALA: fallback con sola traslazione, nessuna variazione di zoom.
+                  var scales = [1.00];
+                  var best = { score: 1e18, sx: fixedCrop.sx, sy: fixedCrop.sy, sw: fixedCrop.sw, sh: fixedCrop.sh };
+                  for (var si = 0; si < scales.length; si++) {
+                    var s = scales[si];
+                    var tw = fixedCrop.sw * s;
+                    var th = fixedCrop.sh * s;
+                    if (tw > vw || th > vh) continue;
+                    if (tw < vw * 0.30 || th < vh * 0.30) continue;
+                    // Crop iniziale centrato sullo stesso centro del fixedCrop
+                    var cx0 = fixedCrop.sx + fixedCrop.sw / 2;
+                    var cy0 = fixedCrop.sy + fixedCrop.sh / 2;
+                    var tsx = cx0 - tw / 2;
+                    var tsy = cy0 - th / 2;
+                    var candidate = { sx: tsx, sy: tsy, sw: tw, sh: th };
+                    var luma = window.__msBuildCropLuma(video, candidate, refLuma.w, refLuma.h);
+                    if (!luma) continue;
+                    var est = window.__msEstimateShift(refLuma, luma, 12);
+                    if (est.score >= best.score) continue;
+                    // Converto dx/dy luma -> pixel sorgente (in scala corrente)
+                    var pxX = tw / refLuma.w;
+                    var pxY = th / refLuma.h;
+                    var sx2 = tsx + (est.dx * pxX);
+                    var sy2 = tsy + (est.dy * pxY);
+                    sx2 = Math.max(0, Math.min((vw - tw), sx2));
+                    sy2 = Math.max(0, Math.min((vh - th), sy2));
+                    best = { score: est.score, sx: sx2, sy: sy2, sw: tw, sh: th, scale: s, dx: est.dx, dy: est.dy };
+                  }
+                  return best;
+                } catch (_) { return null; }
+              };
+              window.__msShowCollageProgress = function(total, current) {
+                var el = document.getElementById('ms-lv-collage-progress');
+                if (!el) {
+                  el = document.createElement('div');
+                  el.id = 'ms-lv-collage-progress';
+                  (document.body || document.documentElement).appendChild(el);
+                }
+                el.innerHTML = '';
+                for (var i = 0; i < total; i++) {
+                  var d = document.createElement('div');
+                  d.className = 'ms-col-prog-dot' + (i < current ? ' done' : (i === current ? ' cur' : ''));
+                  el.appendChild(d);
+                }
+                el.style.display = 'flex';
+              };
+              window.__msHideCollageProgress = function() {
+                var el = document.getElementById('ms-lv-collage-progress');
+                if (el && el.parentNode) el.parentNode.removeChild(el);
+              };
+              window.__msStopLayoutPreviewLoop = function() {
+                try {
+                  if (window.__msLayoutPreviewRaf) cancelAnimationFrame(window.__msLayoutPreviewRaf);
+                } catch (_) {}
+                window.__msLayoutPreviewRaf = 0;
+              };
+              window.__msStartLayoutPreviewLoop = function() {
+                try { window.__msStopLayoutPreviewLoop(); } catch (_) {}
+                var tick = function() {
+                  try {
+                    var overlay = document.getElementById('ms-lv-layout-preview');
+                    if (!overlay) { window.__msLayoutPreviewRaf = 0; return; }
+                    var c = overlay.querySelector('.ms-lp-cell[data-state="active"] canvas.ms-lp-live-canvas');
+                    var video = document.getElementById('ms-cam-video');
+                    if (c && video && video.videoWidth > 0 && video.videoHeight > 0) {
+                      var ctx = c.getContext('2d');
+                      var cw = c.width | 0, ch = c.height | 0;
+                      var vw = video.videoWidth | 0, vh = video.videoHeight | 0;
+                      var slotAR = cw / ch, vAR = vw / vh;
+                      var sx = 0, sy = 0, sw = vw, sh = vh;
+                      var fixed = window.__msLayoutPreviewCrop;
+                      if (fixed && fixed.vw === vw && fixed.vh === vh && Math.abs((fixed.slotAR || slotAR) - slotAR) < 0.0001) {
+                        sx = fixed.sx; sy = fixed.sy; sw = fixed.sw; sh = fixed.sh;
+                      } else {
+                        if (vAR > slotAR) {
+                          sw = vh * slotAR;
+                          sx = (vw - sw) / 2;
+                        } else if (vAR < slotAR) {
+                          sh = vw / slotAR;
+                          sy = (vh - sh) / 2;
+                        }
+                      }
+                      ctx.clearRect(0, 0, cw, ch);
+                      ctx.save();
+                      ctx.translate(cw, 0);
+                      ctx.scale(-1, 1);
+                      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, cw, ch);
+                      ctx.restore();
+                    }
+                  } catch (_) {}
+
+                  try { window.__msLayoutPreviewRaf = requestAnimationFrame(tick); } catch (_) { window.__msLayoutPreviewRaf = 0; }
+                };
+                try { window.__msLayoutPreviewRaf = requestAnimationFrame(tick); } catch (_) { window.__msLayoutPreviewRaf = 0; }
+              };
+              window.__msRenderLayoutPreview = function(layoutKey, activeIdx, thumbs) {
+                var slots = window.__MS_COLLAGE_LAYOUTS[layoutKey] || [];
+                var overlay = document.getElementById('ms-lv-layout-preview');
+                if (!slots.length || layoutKey === '1') {
+                  if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+                  try {
+                    var __g0 = document.getElementById('ms-lv-grid');
+                    if (__g0) __g0.style.removeProperty('display');
+                  } catch (_) {}
+                  try { window.__msStopLayoutPreviewLoop(); } catch (_) {}
+                  return;
+                }
+                if (!overlay) {
+                  overlay = document.createElement('div');
+                  overlay.id = 'ms-lv-layout-preview';
+                  (document.body || document.documentElement).appendChild(overlay);
+                }
+                var fsEl = document.fullscreenElement || document.webkitFullscreenElement || null;
+                var root = (typeof getPreferredParent === 'function' ? getPreferredParent() : null) || fsEl || document.body || document.documentElement;
+                if (root && overlay.parentNode !== root) root.appendChild(overlay);
+                overlay.style.setProperty('z-index', '2147483644', 'important');
+                try {
+                  var __g = document.getElementById('ms-lv-grid');
+                  if (__g) __g.style.setProperty('display', 'none', 'important');
+                } catch (_) {}
+                overlay.innerHTML = '';
+                var sheet = document.createElement('div');
+                sheet.className = 'ms-lp-sheet';
+                try {
+                  // La finestra layout deve seguire il foro foto gia' calibrato,
+                  // non il rettangolo esterno della cornice/foglio.
+                  var photoEl = document.getElementById('video') || document.querySelector('video');
+                  var pr = photoEl && photoEl.getBoundingClientRect ? photoEl.getBoundingClientRect() : null;
+                  if (pr && pr.width > 8 && pr.height > 8) {
+                    sheet.style.setProperty('position', 'fixed', 'important');
+                    sheet.style.setProperty('left', pr.left + 'px', 'important');
+                    sheet.style.setProperty('top', pr.top + 'px', 'important');
+                    sheet.style.setProperty('width', pr.width + 'px', 'important');
+                    sheet.style.setProperty('height', pr.height + 'px', 'important');
+                    sheet.style.setProperty('max-width', 'none', 'important');
+                    sheet.style.setProperty('max-height', 'none', 'important');
+                  }
+                } catch (_) {}
+                var backdrop = document.createElement('div');
+                backdrop.className = 'ms-lp-backdrop';
+                sheet.appendChild(backdrop);
+                overlay.appendChild(sheet);
+                var W = 1200, H = 1800;
+                var safeActive = (typeof activeIdx === 'number') ? activeIdx : 0;
+                var safeThumbs = thumbs || [];
+                slots.forEach(function(s, i) {
+                  var cell = document.createElement('div');
+                  cell.className = 'ms-lp-cell';
+                  cell.style.left = (s.x / W * 100) + '%';
+                  cell.style.top = (s.y / H * 100) + '%';
+                  cell.style.width = (s.w / W * 100) + '%';
+                  cell.style.height = (s.h / H * 100) + '%';
+                  var state;
+                  if (i < safeActive) state = 'done';
+                  else if (i === safeActive) state = 'active';
+                  else state = 'idle';
+                  cell.setAttribute('data-state', state);
+                  if (safeThumbs[i]) {
+                    var img = document.createElement('img');
+                    img.className = 'ms-lp-thumb';
+                    img.src = safeThumbs[i];
+                    cell.appendChild(img);
+                  } else if (state === 'active') {
+                    var liveCanvas = document.createElement('canvas');
+                    liveCanvas.className = 'ms-lp-live-canvas';
+                    liveCanvas.width = Math.max(240, Math.round(s.w));
+                    liveCanvas.height = Math.max(240, Math.round(s.h));
+                    cell.appendChild(liveCanvas);
+                  }
+                  if (!safeThumbs[i]) {
+                    var logo = document.createElement('div');
+                    logo.className = 'ms-lp-logo';
+                    var logoImg = document.createElement('img');
+                    logoImg.className = 'ms-lp-logo-img';
+                    logoImg.src = 'logo sballando.png';
+                    logo.appendChild(logoImg);
+                    cell.appendChild(logo);
+                  }
+                  var num = document.createElement('div');
+                  num.className = 'ms-lp-num';
+                  num.textContent = (i + 1) + '/' + slots.length;
+                  cell.appendChild(num);
+                  if (state === 'active') {
+                    var big = document.createElement('div');
+                    big.className = 'ms-lp-bigshot';
+                    big.textContent = 'Scatto ' + (i + 1) + ' di ' + slots.length;
+                    cell.appendChild(big);
+                  }
+                  sheet.appendChild(cell);
+                });
+                try { window.__msStartLayoutPreviewLoop(); } catch (_) {}
+              };
+              window.__msHideLayoutPreview = function() {
+                try { window.__msStopLayoutPreviewLoop(); } catch (_) {}
+                try {
+                  var __g = document.getElementById('ms-lv-grid');
+                  if (__g) __g.style.removeProperty('display');
+                } catch (_) {}
+                var overlay = document.getElementById('ms-lv-layout-preview');
+                if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+              };
+              window.__msCaptureSlotThumb = function(video, slot, fixedCrop) {
+                try {
+                  var c = document.createElement('canvas');
+                  var ratio = slot.w / slot.h;
+                  c.width = 240;
+                  c.height = Math.round(240 / ratio);
+                  var cx = c.getContext('2d');
+                  cx.fillStyle = '#000';
+                  cx.fillRect(0, 0, c.width, c.height);
+                  var vw = video && video.videoWidth | 0;
+                  var vh = video && video.videoHeight | 0;
+                  if (!vw || !vh) return '';
+                  var slotAR = c.width / c.height, vAR = vw / vh;
+                  var sx = 0, sy = 0, sw = vw, sh = vh;
+                  if (fixedCrop && fixedCrop.vw === vw && fixedCrop.vh === vh && Math.abs((fixedCrop.slotAR || slotAR) - slotAR) < 0.0001) {
+                    sx = fixedCrop.sx; sy = fixedCrop.sy; sw = fixedCrop.sw; sh = fixedCrop.sh;
+                  } else {
+                    if (vAR > slotAR) { sw = vh * slotAR; sx = (vw - sw) / 2; }
+                    else if (vAR < slotAR) { sh = vw / slotAR; sy = (vh - sh) / 2; }
+                  }
+                  cx.save();
+                  cx.translate(c.width, 0);
+                  cx.scale(-1, 1);
+                  cx.drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
+                  cx.restore();
+                  return c.toDataURL('image/jpeg', 0.7);
+                } catch (_) { return ''; }
+              };
+              window.__msRunCollage = function(layoutKey) {
+                var slots = window.__MS_COLLAGE_LAYOUTS[layoutKey];
+                var video = document.getElementById('ms-cam-video');
+                if (!video || !slots || !slots.length) {
+                  try { window.__msLayoutPreviewCrop = null; } catch (_) {}
+                  window.__msShootInFlight = false;
+                  return;
+                }
+                try {
+                  window.__msPreviewDismissed = false;
+                  window.__msPreviewActive = false;
+                } catch (_) {}
+                var W = 1200, H = 1800;
+                var canvas = document.createElement('canvas');
+                canvas.width = W; canvas.height = H;
+                var ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, W, H);
+                var i = 0;
+                var thumbs = [];
+                var fixedCrop = null;
+                var refFace = null;
+                var refLuma = null;
+                try {
+                  fixedCrop = window.__msComputeFixedCrop(video, slots[0]);
+                  window.__msLayoutPreviewCrop = fixedCrop || null;
+                } catch (_) { fixedCrop = null; }
+                // Pre-inizializzo il FaceDetector per evitare lag al primo scatto
+                try { window.__msGetFaceDetector(); } catch (_) {}
+                var __finishShot = function(useCrop, __alignDbg) {
+                  try {
+                    console.log('[ms] collage shot=' + i + ' vw=' + (video && video.videoWidth) + ' vh=' + (video && video.videoHeight) +
+                      ' fixed=' + (fixedCrop ? ('sx='+fixedCrop.sx+' sy='+fixedCrop.sy+' sw='+fixedCrop.sw+' sh='+fixedCrop.sh+' vw='+fixedCrop.vw+' vh='+fixedCrop.vh) : 'null') +
+                      ' use=' + (useCrop ? ('sx='+Math.round(useCrop.sx)+' sy='+Math.round(useCrop.sy)+' sw='+Math.round(useCrop.sw)+' sh='+Math.round(useCrop.sh)) : 'null') +
+                      (__alignDbg || ''));
+                  } catch (_) {}
+                  try { thumbs[i] = window.__msCaptureSlotThumb(video, slots[i], useCrop || fixedCrop) || ''; } catch (_) {}
+                  try {
+                    if (useCrop && video && video.videoWidth === useCrop.vw && video.videoHeight === useCrop.vh) {
+                      var __slot = slots[i];
+                      var __g = 12;
+                      var __x = __slot.x + __g, __y = __slot.y + __g;
+                      var __w = __slot.w - __g * 2, __h = __slot.h - __g * 2;
+                      if (__w > 0 && __h > 0) {
+                        ctx.save();
+                        ctx.beginPath(); ctx.rect(__x, __y, __w, __h); ctx.clip();
+                        ctx.translate(__x + __w, __y); ctx.scale(-1, 1);
+                        ctx.drawImage(video, useCrop.sx, useCrop.sy, useCrop.sw, useCrop.sh, 0, 0, __w, __h);
+                        ctx.restore();
+                      }
+                    } else {
+                      window.__msDrawSlot(ctx, video, slots[i], 12);
+                    }
+                  } catch (_) {}
+                  i++;
+                  try { window.__msShowCollageProgress(slots.length, i); } catch (_) {}
+                  try { window.__msRenderLayoutPreview(layoutKey, i, thumbs); } catch (_) {}
+                  if (i >= slots.length) { setTimeout(finalize, 350); }
+                  else { setTimeout(nextShot, 750); }
+                };
+                var nextShot = function() {
+                  if (i >= slots.length) { finalize(); return; }
+                  try { window.__msShowCollageProgress(slots.length, i); } catch (_) {}
+                  try { window.__msRenderLayoutPreview(layoutKey, i, thumbs); } catch (_) {}
+                  window.__msShowCountdown(function() {
+                    // Face-based alignment: shot 0 cattura il volto di riferimento, gli altri ci si allineano
+                    var detPromise;
+                    try { detPromise = window.__msDetectFaceBBox(video); } catch (_) { detPromise = Promise.resolve(null); }
+                    detPromise.then(function(curFace) {
+                      var useCrop = fixedCrop;
+                      var dbg = '';
+                      try {
+                        if (fixedCrop && !refLuma) {
+                          refLuma = window.__msBuildCropLuma(video, fixedCrop, 192, 144);
+                        }
+                        if (!fixedCrop || !curFace) {
+                          // Fallback: allineamento scala+shift sul frame (sfondo) rispetto al primo scatto
+                          if (fixedCrop && refLuma && i > 0) {
+                            var affFallback = window.__msEstimateAffineCrop(video, fixedCrop, refLuma);
+                            if (affFallback && affFallback.sw && affFallback.sh) {
+                              useCrop = {
+                                sx: affFallback.sx, sy: affFallback.sy, sw: affFallback.sw, sh: affFallback.sh,
+                                vw: fixedCrop.vw, vh: fixedCrop.vh, slotAR: fixedCrop.slotAR
+                              };
+                              dbg = ' face=' + (curFace ? 'yes' : 'no') + ' fallback=affine scale=' + (affFallback.scale || 1).toFixed(3) +
+                                ' dx=' + affFallback.dx + ' dy=' + affFallback.dy + ' score=' + Math.round(affFallback.score);
+                            } else {
+                              dbg = ' face=' + (curFace ? 'yes' : 'no') + ' fallback=none';
+                            }
+                          } else {
+                            dbg = ' face=' + (curFace ? 'yes' : 'no') + ' fallback=skip';
+                          }
+                        } else if (!refFace) {
+                          refFace = curFace;
+                          dbg = ' face=REF cx=' + Math.round(curFace.cx) + ' cy=' + Math.round(curFace.cy) + ' w=' + Math.round(curFace.w) + ' detMs=' + curFace.detMs;
+                        } else {
+                          var aligned = window.__msFaceAlignCrop(fixedCrop, refFace, curFace);
+                          if (aligned) {
+                            useCrop = aligned;
+                            dbg = ' face=cx=' + Math.round(curFace.cx) + ' cy=' + Math.round(curFace.cy) + ' w=' + Math.round(curFace.w) +
+                              ' scale=' + (aligned.scale || 1).toFixed(3) + ' detMs=' + curFace.detMs;
+                          } else {
+                            // fallback affine anche se il face-align fallisce
+                            if (fixedCrop && refLuma && i > 0) {
+                              var affOnFail = window.__msEstimateAffineCrop(video, fixedCrop, refLuma);
+                              if (affOnFail && affOnFail.sw && affOnFail.sh) {
+                                useCrop = {
+                                  sx: affOnFail.sx, sy: affOnFail.sy, sw: affOnFail.sw, sh: affOnFail.sh,
+                                  vw: fixedCrop.vw, vh: fixedCrop.vh, slotAR: fixedCrop.slotAR
+                                };
+                                dbg = ' face=found-but-align-failed fallback=affine scale=' + (affOnFail.scale || 1).toFixed(3) +
+                                  ' dx=' + affOnFail.dx + ' dy=' + affOnFail.dy + ' score=' + Math.round(affOnFail.score);
+                              } else {
+                                dbg = ' face=found-but-align-failed fallback=none';
+                              }
+                            } else {
+                              dbg = ' face=found-but-align-failed fallback=skip';
+                            }
+                          }
+                        }
+                      } catch (_) {}
+                      __finishShot(useCrop, dbg);
+                    });
+                  });
+                };
+                var finalize = function() {
+                  try {
+                    canvas.toBlob(function(blob) {
+                      try { window.__msLayoutPreviewCrop = null; } catch (_) {}
+                      try { window.__msHideCollageProgress(); } catch (_) {}
+                      try { window.__msHideLayoutPreview(); } catch (_) {}
+                      if (!blob) { window.__msShootInFlight = false; return; }
+                      var url = URL.createObjectURL(blob);
+                      var stamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+                      var fname = 'collage_' + stamp + '.jpg';
+                      try { localStorage.setItem('last_picture_name', fname); } catch (_) {}
+                      try { localStorage.setItem('last_picture_url', url); } catch (_) {}
+                      try { window.__msPreviewFallbackUrl = url; } catch (_) {}
+                      var ft = document.getElementById('foto_temp');
+                      var img = ft && ft.querySelector('img');
+                      if (img) img.src = url;
+                      if (ft) {
+                        try { ft.style.setProperty('display', 'flex', 'important'); } catch (_) { ft.style.display = 'flex'; }
+                        try { ft.style.setProperty('visibility', 'visible', 'important'); } catch (_) { ft.style.visibility = 'visible'; }
+                        try { ft.style.setProperty('opacity', '1', 'important'); } catch (_) { ft.style.opacity = '1'; }
+                      }
+                      try {
+                        window.__msPreviewDismissed = false;
+                        window.__msPreviewActive = true;
+                        window.__msHideOverlayUntil = Date.now() + 300;
+                      } catch (_) {}
+                      try {
+                        var __trg = document.getElementById('ms-collage-preview-trigger');
+                        if (!__trg) {
+                          __trg = document.createElement('button');
+                          __trg.id = 'ms-collage-preview-trigger';
+                          __trg.type = 'button';
+                          __trg.setAttribute('aria-hidden', 'true');
+                          __trg.style.position = 'fixed';
+                          __trg.style.left = '-9999px';
+                          __trg.style.top = '0';
+                          __trg.style.width = '1px';
+                          __trg.style.height = '1px';
+                          __trg.style.opacity = '0';
+                          __trg.style.pointerEvents = 'none';
+                          (document.body || document.documentElement).appendChild(__trg);
+                        }
+                        if (typeof __trg.click === 'function') __trg.click();
+                      } catch (_) {}
+                      try {
+                        if (typeof __msEnsurePreview === 'function' && ft) {
+                          var __okPrev = __msEnsurePreview(ft, url);
+                          console.log('[ms] collage preview ensure=' + (__okPrev ? 'ok' : 'fail'));
+                        }
+                      } catch (_) {}
+                      try {
+                        if (typeof window._msSessionFrameLiteSync === 'function') {
+                          window._msSessionFrameLiteSync();
+                          [60, 180, 420].forEach(function(d) {
+                            setTimeout(function() {
+                              try { window._msSessionFrameLiteSync(); } catch (_) {}
+                            }, d);
+                          });
+                        }
+                      } catch (_) {}
+                      console.log('[ms] collage done layout=' + layoutKey + ' shots=' + slots.length);
+                      window.__msShootInFlight = false;
+                    }, 'image/jpeg', 0.95);
+                  } catch (e) {
+                    try { window.__msLayoutPreviewCrop = null; } catch (_) {}
+                    try { window.__msHideCollageProgress(); } catch (_) {}
+                    console.log('[ms] collage finalize err: ' + e.message);
+                    window.__msShootInFlight = false;
+                  }
+                };
+                nextShot();
+              };
+            }
+
+            // ── Pannello layout (5 opzioni) — floating sinistra ──
+            if (!document.getElementById('ms-lv-collage-panel')) {
+              var panel = document.createElement('div');
+              panel.id = 'ms-lv-collage-panel';
+              var ic1 = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>';
+              var ic2v = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/></svg>';
+              var ic2h = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="16" rx="1.5"/><rect x="13" y="4" width="7" height="16" rx="1.5"/></svg>';
+              var ic4  = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.2"/><rect x="13" y="4" width="7" height="7" rx="1.2"/><rect x="4" y="13" width="7" height="7" rx="1.2"/><rect x="13" y="13" width="7" height="7" rx="1.2"/></svg>';
+              var ic3s = '<svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="5" rx="1.2"/><rect x="4" y="9.5" width="16" height="5" rx="1.2"/><rect x="4" y="16" width="16" height="5" rx="1.2"/></svg>';
+              var defs = [
+                { k: '1',      svg: ic1,  label: '1 foto' },
+                { k: '2v',     svg: ic2v, label: '2 verticali' },
+                { k: '2h',     svg: ic2h, label: '2 orizzontali' },
+                { k: '4',      svg: ic4,  label: '4 quadrati' },
+                { k: 'strip3', svg: ic3s, label: 'Strip 3' }
+              ];
+              var title = document.createElement('button');
+              title.type = 'button';
+              title.className = 'ms-col-title';
+              title.textContent = 'LAYOUT';
+              title.addEventListener('click', function(ev) {
+                ev.preventDefault(); ev.stopPropagation();
+                if (window.__msShootInFlight) return;
+                panel.classList.toggle('is-open');
+              });
+              panel.appendChild(title);
+              var current = window.__msGetCollageLayout();
+              defs.forEach(function(d) {
+                var b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'ms-col-btn' + (d.k === current ? ' is-active' : '');
+                b.setAttribute('data-key', d.k);
+                b.setAttribute('title', d.label);
+                b.setAttribute('aria-label', d.label);
+                b.innerHTML = d.svg;
+                b.addEventListener('click', function(ev) {
+                  ev.preventDefault(); ev.stopPropagation();
+                  if (window.__msShootInFlight) return;
+                  window.__msSetCollageLayout(d.k);
+                  var nodes = panel.querySelectorAll('.ms-col-btn');
+                  for (var n = 0; n < nodes.length; n++) {
+                    nodes[n].classList.toggle('is-active', nodes[n].getAttribute('data-key') === d.k);
+                  }
+                  panel.classList.remove('is-open');
+                  try {
+                    if (typeof window.__msRenderLayoutPreview === 'function') {
+                      window.__msRenderLayoutPreview(d.k, 0, []);
+                      setTimeout(function() {
+                        try {
+                          if (typeof window._msSessionFrameLiteSync === 'function') window._msSessionFrameLiteSync();
+                          window.__msRenderLayoutPreview(d.k, 0, []);
+                        } catch (_) {}
+                      }, 40);
+                    }
+                  } catch (_) {}
+                });
+                panel.appendChild(b);
+              });
+              (document.body || document.documentElement).appendChild(panel);
+              document.addEventListener('click', function(ev) {
+                try {
+                  if (!panel || !panel.isConnected || panel.contains(ev.target)) return;
+                  panel.classList.remove('is-open');
+                } catch (_) {}
+              }, true);
+              try {
+                if (typeof window.__msRenderLayoutPreview === 'function') {
+                  window.__msRenderLayoutPreview(current, 0, []);
+                  setTimeout(function() {
+                    try {
+                      if (typeof window._msSessionFrameLiteSync === 'function') window._msSessionFrameLiteSync();
+                      window.__msRenderLayoutPreview(current, 0, []);
+                    } catch (_) {}
+                  }, 40);
+                }
+              } catch (_) {}
+            }
+
+            // ── Griglia 2x2 sottile sopra la preview ──
+            if (!document.getElementById('ms-lv-grid')) {
+              var grid = document.createElement('div');
+              grid.id = 'ms-lv-grid';
+              (document.body || document.documentElement).appendChild(grid);
+            }
+
             // Click "scatta" → eseguiamo NOI il countdown visivo, poi al termine
-            // clicchiamo captureBtn. Non usiamo count_down_start() della pagina remota
-            // perché in sessione fa partire captureBtn immediatamente (select non caricato).
+            // clicchiamo captureBtn. Se è selezionato un layout multi-foto, eseguiamo
+            // invece la sequenza collage (più scatti → singola foto composita).
             document.getElementById('ms-lv-shoot').addEventListener('click', function(ev) {
               ev.preventDefault(); ev.stopPropagation();
               try {
@@ -1780,6 +2952,14 @@ function injectSessionFrameOverlay(win, targetFrame) {
                 var __sb = this;
                 __sb.classList.add('ms-lv-flash');
                 setTimeout(function() { try { __sb.classList.remove('ms-lv-flash'); } catch (_) {} }, 500);
+
+                var __layout = (typeof window.__msGetCollageLayout === 'function') ? window.__msGetCollageLayout() : '1';
+                if (__layout && __layout !== '1' && typeof window.__msRunCollage === 'function') {
+                  // Sequenza collage multi-scatto, poi salva come UNA singola foto
+                  console.log('[ms] start collage layout=' + __layout);
+                  window.__msRunCollage(__layout);
+                  return;
+                }
 
                 // Avvia il NOSTRO countdown e al termine clicca captureBtn
                 try {
@@ -1820,6 +3000,13 @@ function injectSessionFrameOverlay(win, targetFrame) {
           if (scrimEl && root && scrimEl.parentNode !== root) root.appendChild(scrimEl);
           var vigEl = document.getElementById('ms-lv-vignette');
           if (vigEl && root && vigEl.parentNode !== root) root.appendChild(vigEl);
+          var colPanelEl = document.getElementById('ms-lv-collage-panel');
+          if (colPanelEl && root && colPanelEl.parentNode !== root) root.appendChild(colPanelEl);
+          var gridEl = document.getElementById('ms-lv-grid');
+          if (gridEl && root && gridEl.parentNode !== root) root.appendChild(gridEl);
+          var layoutPreviewEl = document.getElementById('ms-lv-layout-preview');
+          var layoutPreviewRoot = (typeof getPreferredParent === 'function' ? getPreferredParent() : null) || root;
+          if (layoutPreviewEl && layoutPreviewRoot && layoutPreviewEl.parentNode !== layoutPreviewRoot) layoutPreviewRoot.appendChild(layoutPreviewEl);
         } catch (_) {}
       }
 
@@ -2439,6 +3626,119 @@ function injectSessionFrameOverlay(win, targetFrame) {
           ov.style.setProperty('visibility', 'visible', 'important');
           ov.style.setProperty('opacity', '1', 'important');
           ov.style.setProperty('z-index', '2147483646', 'important');
+          try {
+            var cal = resolveFrameCalibration();
+            var vw = Math.max(1, window.innerWidth || 1);
+            var vh = Math.max(1, window.innerHeight || 1);
+            ensureBlackBackdrop();
+            var zoom = Number(cal && cal.zoomPct) / 100;
+            var photoZoom = Number(cal && cal.photoZoomPct) / 100;
+            if (!isFinite(zoom)) zoom = 1;
+            if (!isFinite(photoZoom)) photoZoom = 1;
+            if (zoom < 0.5) zoom = 0.5;
+            if (zoom > 2) zoom = 2;
+            if (photoZoom < 0.5) photoZoom = 0.5;
+            if (photoZoom > 2) photoZoom = 2;
+            var frameW = vw * zoom;
+            var frameH = vh * zoom;
+            var offX = (Number(cal && cal.offsetXmm) / 100) * vw;
+            var offY = (Number(cal && cal.offsetYmm) / 150) * vh;
+            var photoOffX = (Number(cal && cal.photoOffsetXmm) / 100) * vw;
+            var photoOffY = (Number(cal && cal.photoOffsetYmm) / 150) * vh;
+            if (!isFinite(offX)) offX = 0;
+            if (!isFinite(offY)) offY = 0;
+            if (!isFinite(photoOffX)) photoOffX = 0;
+            if (!isFinite(photoOffY)) photoOffY = 0;
+            var frameX = (vw - frameW) / 2 + offX;
+            var frameY = (vh - frameH) / 2 + offY;
+            var photoBase = (typeof __msGetPreviewRectForSource === 'function') ? __msGetPreviewRectForSource(src) : null;
+            var basePhotoX = photoBase ? (photoBase.left * vw) : 0;
+            var basePhotoY = photoBase ? (photoBase.top * vh) : 0;
+            var basePhotoW = photoBase ? (photoBase.width * vw) : vw;
+            var basePhotoH = photoBase ? (photoBase.height * vh) : vh;
+            var photoW = basePhotoW * photoZoom;
+            var photoH = basePhotoH * photoZoom;
+            var photoX = basePhotoX + (basePhotoW - photoW) / 2 + photoOffX;
+            var photoY = basePhotoY + (basePhotoH - photoH) / 2 + photoOffY;
+
+            // Geometria live pre-scatto: segue solo la calibrazione Foto.
+            try {
+              var liveVideo = document.getElementById('video') || document.querySelector('video');
+              if (liveVideo) {
+                liveVideo.style.setProperty('position', 'fixed', 'important');
+                liveVideo.style.setProperty('left', photoX + 'px', 'important');
+                liveVideo.style.setProperty('top', photoY + 'px', 'important');
+                liveVideo.style.setProperty('width', photoW + 'px', 'important');
+                liveVideo.style.setProperty('height', photoH + 'px', 'important');
+                liveVideo.style.setProperty('object-fit', 'cover', 'important');
+                liveVideo.style.setProperty('margin', '0', 'important');
+                liveVideo.style.setProperty('padding', '0', 'important');
+                liveVideo.style.setProperty('border', '0', 'important');
+                liveVideo.style.setProperty('z-index', '2147483644', 'important');
+              }
+            } catch (_) {}
+            try {
+              var lpSheet = document.querySelector('#ms-lv-layout-preview .ms-lp-sheet');
+              if (lpSheet) {
+                lpSheet.style.setProperty('position', 'fixed', 'important');
+                lpSheet.style.setProperty('left', photoX + 'px', 'important');
+                lpSheet.style.setProperty('top', photoY + 'px', 'important');
+                lpSheet.style.setProperty('width', photoW + 'px', 'important');
+                lpSheet.style.setProperty('height', photoH + 'px', 'important');
+                lpSheet.style.setProperty('max-width', 'none', 'important');
+                lpSheet.style.setProperty('max-height', 'none', 'important');
+              }
+            } catch (_) {}
+
+            // Cornice live pre-scatto: stessa geometria della calibrazione/salvataggio.
+            ov.style.setProperty('position', 'fixed', 'important');
+            ov.style.setProperty('inset', 'auto', 'important');
+            ov.style.setProperty('left', frameX + 'px', 'important');
+            ov.style.setProperty('top', frameY + 'px', 'important');
+            ov.style.setProperty('width', frameW + 'px', 'important');
+            ov.style.setProperty('height', frameH + 'px', 'important');
+
+            // Nero pieno fuori dalla cornice: in pre-scatto non deve filtrare
+            // la pagina/camera sotto le parti trasparenti della cornice.
+            var left = Math.max(0, Math.min(vw, frameX));
+            var top = Math.max(0, Math.min(vh, frameY));
+            var right = Math.max(0, Math.min(vw, frameX + frameW));
+            var bottom = Math.max(0, Math.min(vh, frameY + frameH));
+            var visW = Math.max(0, right - left);
+            var visH = Math.max(0, bottom - top);
+
+            if (visW < 8 || visH < 8) {
+              hideWhiteMasks();
+            } else {
+              var masks = ensureWhiteMasks();
+              masks.top.style.setProperty('display', 'block', 'important');
+              masks.top.style.setProperty('left', '0px', 'important');
+              masks.top.style.setProperty('top', '0px', 'important');
+              masks.top.style.setProperty('width', vw + 'px', 'important');
+              masks.top.style.setProperty('height', top + 'px', 'important');
+
+              masks.bottom.style.setProperty('display', 'block', 'important');
+              masks.bottom.style.setProperty('left', '0px', 'important');
+              masks.bottom.style.setProperty('top', bottom + 'px', 'important');
+              masks.bottom.style.setProperty('width', vw + 'px', 'important');
+              masks.bottom.style.setProperty('height', Math.max(0, vh - bottom) + 'px', 'important');
+
+              masks.left.style.setProperty('display', 'block', 'important');
+              masks.left.style.setProperty('left', '0px', 'important');
+              masks.left.style.setProperty('top', top + 'px', 'important');
+              masks.left.style.setProperty('width', left + 'px', 'important');
+              masks.left.style.setProperty('height', visH + 'px', 'important');
+
+              masks.right.style.setProperty('display', 'block', 'important');
+              masks.right.style.setProperty('left', right + 'px', 'important');
+              masks.right.style.setProperty('top', top + 'px', 'important');
+              masks.right.style.setProperty('width', Math.max(0, vw - right) + 'px', 'important');
+              masks.right.style.setProperty('height', visH + 'px', 'important');
+            }
+          } catch (_) {
+            hideBlackBackdrop();
+            hideWhiteMasks();
+          }
           // SEMPRE rispostare come ultimo figlio del parent del video, ad ogni tick
           try {
             if (preferredParent && (ov.parentNode !== preferredParent || preferredParent.lastElementChild !== ov)) {
@@ -2459,11 +3759,28 @@ function injectSessionFrameOverlay(win, targetFrame) {
             } catch (_) {}
           }
         } else {
+          try {
+            var __lv = document.getElementById('video') || document.querySelector('video');
+            if (__lv) {
+              __lv.style.removeProperty('position');
+              __lv.style.removeProperty('left');
+              __lv.style.removeProperty('top');
+              __lv.style.removeProperty('width');
+              __lv.style.removeProperty('height');
+              __lv.style.removeProperty('object-fit');
+              __lv.style.removeProperty('margin');
+              __lv.style.removeProperty('padding');
+              __lv.style.removeProperty('border');
+              __lv.style.removeProperty('z-index');
+            }
+          } catch (_) {}
           if (!window.__msFrameHideLogged && sess && (rev || !src || hideAfterCapture)) {
             window.__msFrameHideLogged = true;
             try { console.log('[ms] cornice OFF sess=' + sess + ' review=' + rev + ' captureHide=' + hideAfterCapture + ' hasSrc=' + (src ? 'yes' : 'no')); } catch (_) {}
             setTimeout(function() { window.__msFrameHideLogged = false; }, 2000);
           }
+          hideWhiteMasks();
+          hideBlackBackdrop();
           ov.style.setProperty('display', 'none', 'important');
           if (ov.src) ov.src = '';
           window.__msFrameOnLogged = false;
@@ -2484,7 +3801,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
               var txt = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
               var cls = (el.className && String(el.className).trim()) ? String(el.className).trim().split(/\s+/).slice(0, 4).join('.') : '-';
               console.log('[ms] click tag=' + el.tagName + ' id=' + (el.id || '-') + ' cls=' + cls + ' txt=' + txt);
-              if (el.id === 'captureBtn') {
+              if (el.id === 'captureBtn' || el.id === 'ms-collage-preview-trigger') {
                 // Reset flag dismiss precedente: se l'utente fa un altro scatto
                 // entro 5s dal dismiss della preview precedente, il flag
                 // __msPreviewDismissed e' ancora true e farebbe abortire
@@ -2635,6 +3952,46 @@ function injectSessionFrameOverlay(win, targetFrame) {
                     }
                   } catch (_) {}
 
+                  // Applica stessa calibrazione del salvataggio alla preview post-scatto
+                  // (offset/zoom della CORNICE; foto full-bleed sotto).
+                  try {
+                    var __clampCal = function(v, min, max, fb) {
+                      var n = parseFloat(v);
+                      if (!isFinite(n)) n = fb;
+                      n = Math.max(min, Math.min(max, n));
+                      return Math.round(n * 10) / 10;
+                    };
+                    var __cal = null;
+                    try {
+                      if (typeof window.__msGetEffectiveCalibrationForSave === 'function') {
+                        __cal = window.__msGetEffectiveCalibrationForSave('postcard');
+                      }
+                    } catch (_) {}
+                    if (!__cal || typeof __cal !== 'object') {
+                      var __preset = {};
+                      try { __preset = JSON.parse(localStorage.getItem('ms-cal-presets-v1') || '{}') || {}; } catch (_) { __preset = {}; }
+                      __cal = (__preset && __preset.postcard) ? __preset.postcard : { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
+                    }
+                    var __offXmm = __clampCal(__cal.offsetXmm, -5, 5, 0);
+                    var __offYmm = __clampCal(__cal.offsetYmm, -5, 5, 0);
+                    var __zoomPct = __clampCal(__cal.zoomPct, 80, 120, 100);
+                    var __photoOffXmm = __clampCal(__cal.photoOffsetXmm, -5, 5, 0);
+                    var __photoOffYmm = __clampCal(__cal.photoOffsetYmm, -5, 5, 0);
+                    var __photoZoomPct = __clampCal(__cal.photoZoomPct, 80, 120, 100);
+                    var __zoom = __zoomPct / 100;
+                    var __photoZoom = __photoZoomPct / 100;
+                    if (__zoom < 0.5) __zoom = 0.5;
+                    if (__zoom > 2) __zoom = 2;
+                    if (__photoZoom < 0.5) __photoZoom = 0.5;
+                    if (__photoZoom > 2) __photoZoom = 2;
+                    ft.style.setProperty('--ms-cal-zoom', String(__zoom), 'important');
+                    ft.style.setProperty('--ms-cal-offx-r', String(__offXmm / 100), 'important');
+                    ft.style.setProperty('--ms-cal-offy-r', String(__offYmm / 150), 'important');
+                    ft.style.setProperty('--ms-photo-cal-zoom', String(__photoZoom), 'important');
+                    ft.style.setProperty('--ms-photo-cal-offx-r', String(__photoOffXmm / 100), 'important');
+                    ft.style.setProperty('--ms-photo-cal-offy-r', String(__photoOffYmm / 150), 'important');
+                  } catch (_) {}
+
                   // Filigrana ID SOLO visiva in preview (non viene salvata/stampata)
                   try {
                     var __idWm = ft.querySelector(':scope > div#ms-preview-id-watermark');
@@ -2748,7 +4105,7 @@ function injectSessionFrameOverlay(win, targetFrame) {
                         // Dock entrata
                         '@keyframes msPvDockIn{0%{opacity:0;transform:translate(-50%,26px) scale(0.972);}100%{opacity:1;transform:translate(-50%,0) scale(1);}}' +
                         // OK button respiro sottile
-                        '@keyframes msPvOkBreathe{0%,100%{box-shadow:0 10px 30px rgba(24,165,90,0.34),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.18);}50%{box-shadow:0 12px 40px rgba(24,165,90,0.52),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.22);}}' +
+                        '@keyframes msPvOkBreathe{0%,100%{box-shadow:0 10px 30px rgba(230,57,70,0.34),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.18);}50%{box-shadow:0 12px 40px rgba(230,57,70,0.52),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.22);}}' +
 
                         // ── VARS GEOMETRICHE: card flottante CENTRATA nel viewport ──
                         // Aspect-ratio dello stage 1200x1920. Card centrata "al centro
@@ -2772,6 +4129,12 @@ function injectSessionFrameOverlay(win, targetFrame) {
                           '--ms-photo-top:0.0615;' +
                           '--ms-photo-w:0.8466;' +
                           '--ms-photo-h:0.7812;' +
+                          '--ms-cal-zoom:1;' +
+                          '--ms-cal-offx-r:0;' +
+                          '--ms-cal-offy-r:0;' +
+                          '--ms-photo-cal-zoom:1;' +
+                          '--ms-photo-cal-offx-r:0;' +
+                          '--ms-photo-cal-offy-r:0;' +
                         '}' +
 
                         // ── BACKDROP BLUR DELLA CAMERA LIVE (dietro #foto_temp) ──
@@ -2810,12 +4173,12 @@ function injectSessionFrameOverlay(win, targetFrame) {
                         //   shift-y = -(dock-block / 2) per spostare la card su rispetto al viewport
                         '#ms-preview-main{position:absolute!important;' +
                           'top:50%!important;left:50%!important;' +
-                          'width:calc(var(--ms-card-w) * var(--ms-photo-w) + 10px)!important;' +
-                          'height:calc(var(--ms-card-h) * var(--ms-photo-h) + 10px)!important;' +
-                          'margin-left:calc(var(--ms-card-w) * (var(--ms-photo-left) - 0.5) - 5px)!important;' +
-                          'margin-top:calc(var(--ms-card-h) * (var(--ms-photo-top) - 0.5) - var(--ms-dock-block) / 2 - 5px)!important;' +
+                          'width:calc(var(--ms-card-w) * var(--ms-photo-w) * var(--ms-photo-cal-zoom))!important;' +
+                          'height:calc(var(--ms-card-h) * var(--ms-photo-h) * var(--ms-photo-cal-zoom))!important;' +
+                          'margin-left:calc(var(--ms-card-w) * (var(--ms-photo-left) + var(--ms-photo-w) / 2 - .5 + var(--ms-photo-cal-offx-r) - var(--ms-photo-w) * var(--ms-photo-cal-zoom) / 2))!important;' +
+                          'margin-top:calc(var(--ms-card-h) * (var(--ms-photo-top) + var(--ms-photo-h) / 2 - .5 + var(--ms-photo-cal-offy-r) - var(--ms-photo-h) * var(--ms-photo-cal-zoom) / 2) - var(--ms-dock-block) / 2)!important;' +
                           'object-fit:cover!important;object-position:center center!important;' +
-                          'background:transparent!important;image-rendering:auto!important;' +
+                          'background:#fff!important;image-rendering:auto!important;' +
                           'pointer-events:none!important;z-index:3!important;' +
                           'display:block!important;visibility:visible!important;' +
                           'border-radius:4px!important;padding:0!important;border:0!important;' +
@@ -2824,10 +4187,10 @@ function injectSessionFrameOverlay(win, targetFrame) {
                         // ── CORNICE GRAFICA (stessa centratura, dimensione card piena) ──
                         '#ms-preview-frame-ov{position:absolute!important;' +
                           'top:50%!important;left:50%!important;' +
-                          'width:var(--ms-card-w)!important;' +
-                          'height:var(--ms-card-h)!important;' +
-                          'margin-left:calc(var(--ms-card-w) / -2)!important;' +
-                          'margin-top:calc(var(--ms-card-h) / -2 - var(--ms-dock-block) / 2)!important;' +
+                          'width:calc(var(--ms-card-w) * var(--ms-cal-zoom))!important;' +
+                          'height:calc(var(--ms-card-h) * var(--ms-cal-zoom))!important;' +
+                          'margin-left:calc(var(--ms-card-w) * var(--ms-cal-offx-r) - (var(--ms-card-w) * var(--ms-cal-zoom) / 2))!important;' +
+                          'margin-top:calc(var(--ms-card-h) * var(--ms-cal-offy-r) - (var(--ms-card-h) * var(--ms-cal-zoom) / 2) - var(--ms-dock-block) / 2)!important;' +
                           'object-fit:fill!important;' +
                           'pointer-events:none!important;z-index:5!important;' +
                           'display:block!important;visibility:visible!important;opacity:1!important;' +
@@ -2854,8 +4217,8 @@ function injectSessionFrameOverlay(win, targetFrame) {
 
                         // ── FLOATING DOCK glassmorphism ──
                         '#ms-action-bar{position:absolute;bottom:var(--ms-dock-bottom);left:50%;transform:translateX(-50%);' +
-                          'z-index:2147483645;display:flex;gap:14px;align-items:center;justify-content:center;' +
-                          'padding:12px 14px;border-radius:140px;' +
+                          'z-index:2147483645;display:flex;gap:10px;align-items:center;justify-content:center;' +
+                          'padding:10px 12px;border-radius:140px;max-width:calc(100vw - 32px);box-sizing:border-box;' +
                           // background leggermente più chiaro del bg per creare senso di profondità e separazione dall'area inferiore
                           'background:linear-gradient(180deg,rgba(22,22,28,0.48) 0%,rgba(14,14,18,0.54) 100%);' +
                           'backdrop-filter:blur(50px) saturate(160%) brightness(1.06);' +
@@ -2867,15 +4230,15 @@ function injectSessionFrameOverlay(win, targetFrame) {
                           'animation:msPvDockIn 0.72s cubic-bezier(.22,1.12,.36,1) 0.18s both;}' +
 
                         // ── PULSANTI luxury minimal ──
-                        '.ms-pb-btn{pointer-events:auto;position:relative;display:inline-flex;align-items:center;justify-content:center;gap:10px;' +
-                          'padding:0 26px;height:88px;width:188px;min-width:188px;max-width:188px;border-radius:52px;border:none;box-sizing:border-box;' +
-                          'cursor:pointer;font-size:20px;font-weight:500;letter-spacing:1.6px;' +
+                        '.ms-pb-btn{pointer-events:auto;position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;' +
+                          'padding:0 18px;height:82px;width:170px;min-width:170px;max-width:170px;border-radius:50px;border:none;box-sizing:border-box;' +
+                          'cursor:pointer;font-size:18px;font-weight:500;letter-spacing:1.2px;' +
                           '-webkit-user-select:none;user-select:none;line-height:1;white-space:nowrap;' +
                           'font-family:"SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
                           'transition:transform 0.20s cubic-bezier(.22,1.2,.36,1),box-shadow 0.20s ease,background 0.20s ease,opacity 0.20s ease;' +
                           'overflow:hidden;}' +
                         '.ms-pb-btn:active{transform:scale(0.94)!important;opacity:0.82!important;}' +
-                        '.ms-pb-btn svg{width:22px;height:22px;flex:0 0 auto;}' +
+                        '.ms-pb-btn svg{width:20px;height:20px;flex:0 0 auto;}' +
                         '.ms-pb-btn .ms-pb-lbl{position:relative;z-index:1;}' +
 
                         // Riprova — ghost puro: quasi invisibile, evita di distrarre dal CTA primario
@@ -2884,28 +4247,26 @@ function injectSessionFrameOverlay(win, targetFrame) {
                           'box-shadow:inset 0 1px 0 rgba(255,255,255,0.05);}' +
                         '.ms-pb-cancel:active{background:rgba(255,255,255,0.09)!important;}' +
 
-                        // Stampa — frosted glass toggle
-                        '.ms-pb-stampa{background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.88);' +
-                          'border:1px solid rgba(255,255,255,0.13);' +
-                          'box-shadow:inset 0 1px 0 rgba(255,255,255,0.07);}' +
-                        '.ms-pb-stampa[data-checked="1"]{background:linear-gradient(180deg,rgba(76,126,255,0.30) 0%,rgba(52,96,232,0.18) 100%);' +
-                          'border:1px solid rgba(128,158,255,0.40);color:#fff;' +
-                          'box-shadow:0 6px 24px rgba(55,105,255,0.28),inset 0 1px 0 rgba(255,255,255,0.14);}' +
-                        '.ms-pb-stampa .ms-pb-check{position:absolute;top:12px;right:14px;width:11px;height:11px;border-radius:50%;' +
-                          'background:rgba(255,255,255,0.16);border:1px solid rgba(255,255,255,0.30);transition:all 0.20s ease;}' +
-                        '.ms-pb-stampa[data-checked="1"] .ms-pb-check{background:#fff;border-color:#fff;box-shadow:0 0 8px rgba(255,255,255,0.48);}' +
+                        // Salva e stampa — blu logo Sballando
+                        '.ms-pb-stampa{background:linear-gradient(180deg,rgba(63,105,255,0.88) 0%,rgba(34,67,210,0.92) 100%);color:#fff;' +
+                          'border:1px solid rgba(142,167,255,0.42);' +
+                          'box-shadow:0 8px 26px rgba(55,105,255,0.30),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.16);}' +
+                        '.ms-pb-stampa[data-checked="1"]{background:linear-gradient(180deg,rgba(82,126,255,0.96) 0%,rgba(40,76,224,0.96) 100%);' +
+                          'border:1px solid rgba(166,188,255,0.56);color:#fff;' +
+                          'box-shadow:0 10px 32px rgba(55,105,255,0.44),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.18);}' +
+                        '.ms-pb-stampa .ms-pb-check{display:none!important;}' +
                         '.ms-pb-stampa[data-disabled="1"],.ms-pb-stampa:disabled{background:rgba(255,255,255,0.03)!important;color:rgba(255,255,255,0.42)!important;' +
                           'border:1px solid rgba(255,255,255,0.08)!important;box-shadow:none!important;opacity:0.56!important;cursor:not-allowed!important;pointer-events:none!important;}' +
                         '.ms-pb-stampa[data-disabled="1"] .ms-pb-check,.ms-pb-stampa:disabled .ms-pb-check{background:rgba(255,255,255,0.08)!important;' +
                           'border-color:rgba(255,255,255,0.16)!important;box-shadow:none!important;}' +
 
-                        // Salva — matte green premium, glow soft e rispettoso
-                        '.ms-pb-ok{background:linear-gradient(180deg,rgba(46,196,118,0.93) 0%,rgba(22,160,87,0.93) 100%);' +
+                        // Salva — rosso logo Sballando
+                        '.ms-pb-ok{background:linear-gradient(180deg,rgba(255,78,94,0.96) 0%,rgba(230,57,70,0.96) 52%,rgba(177,28,42,0.96) 100%);' +
                           'color:#fff;font-weight:600;' +
-                          'border:1px solid rgba(255,255,255,0.17);' +
-                          'box-shadow:0 10px 30px rgba(24,165,90,0.34),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.18);' +
+                          'border:1px solid rgba(255,171,180,0.32);' +
+                          'box-shadow:0 10px 30px rgba(230,57,70,0.34),0 3px 10px rgba(0,0,0,0.28),inset 0 1px 0 rgba(255,255,255,0.18);' +
                           'animation:msPvOkBreathe 4.2s ease-in-out infinite;}' +
-                        '.ms-pb-ok:active{animation:none!important;box-shadow:0 5px 16px rgba(24,165,90,0.36)!important;}' +
+                        '.ms-pb-ok:active{animation:none!important;box-shadow:0 5px 16px rgba(230,57,70,0.36)!important;}' +
 
                         // ── BACK BUTTON "Torna al pannello" — top-left glass pill (fixed, sempre visibile) ──
                         '#ms-pb-back{position:fixed!important;top:32px;left:32px;z-index:2147483647;' +
@@ -3224,9 +4585,14 @@ function injectSessionFrameOverlay(win, targetFrame) {
                             return new Promise(function(resolve) {
                               try {
                                 var SW = 1200, SH = 1800;
+                                var PX_PER_MM_X = SW / 100;
+                                var PX_PER_MM_Y = SH / 150;
                                 var cvs = document.createElement('canvas');
                                 cvs.width = SW; cvs.height = SH;
                                 var ctx = cvs.getContext('2d');
+                                // Sfondo bianco: le zone fuori dallo zoom restano bianche (no nero/trasparenza).
+                                ctx.fillStyle = '#ffffff';
+                                ctx.fillRect(0, 0, SW, SH);
                                 // Ottieni src della cornice - cerca in ordine di affidabilità
                                 var fSrc = '';
                                 // 1) ms-preview-frame-ov: è visibile durante la preview/save con src piena
@@ -3265,7 +4631,18 @@ function injectSessionFrameOverlay(win, targetFrame) {
                                     console.log('[ms] composite: localFrames fSrcLen=' + fSrc.length);
                                   } catch (_) {}
                                 }
-                                var drawFrame = function() {
+                                var __detectHoleRect = function(img) {
+                                  try {
+                                    var rect = null;
+                                    if (typeof __msComputeTransparentRectFromImage === 'function') {
+                                      rect = __msComputeTransparentRectFromImage(img);
+                                    }
+                                    var fallbackRect = (typeof __msDefaultPreviewRect !== 'undefined' && __msDefaultPreviewRect) ? __msDefaultPreviewRect : { left: 0.0767, top: 0.0615, width: 0.8466, height: 0.7812 };
+                                    if (typeof __msNormalizePreviewRect === 'function') return __msNormalizePreviewRect(rect, fallbackRect);
+                                    return rect || fallbackRect || null;
+                                  } catch (_) { return null; }
+                                };
+                                var drawFrame = function(frameCal, photoImg) {
                                   if (!fSrc) {
                                     console.log('[ms] composite: no frame src, saving photo only');
                                     resolve(cvs.toDataURL('image/jpeg', 0.95)); return;
@@ -3273,7 +4650,58 @@ function injectSessionFrameOverlay(win, targetFrame) {
                                   var fImg = new Image();
                                   fImg.onload = function() {
                                     try {
-                                      ctx.drawImage(fImg, 0, 0, SW, SH);
+                                      var offXmmF = Number(frameCal && frameCal.offsetXmm);
+                                      var offYmmF = Number(frameCal && frameCal.offsetYmm);
+                                      var zoomPctF = Number(frameCal && frameCal.zoomPct);
+                                      if (!isFinite(offXmmF)) offXmmF = 0;
+                                      if (!isFinite(offYmmF)) offYmmF = 0;
+                                      if (!isFinite(zoomPctF)) zoomPctF = 100;
+                                      var zoomF = zoomPctF / 100;
+                                      if (zoomF < 0.5) zoomF = 0.5;
+                                      if (zoomF > 2) zoomF = 2;
+                                      var frameW = SW * zoomF;
+                                      var frameH = SH * zoomF;
+                                      var offXF = offXmmF * PX_PER_MM_X;
+                                      var offYF = offYmmF * PX_PER_MM_Y;
+                                      var photoOffXmmF = Number(frameCal && frameCal.photoOffsetXmm);
+                                      var photoOffYmmF = Number(frameCal && frameCal.photoOffsetYmm);
+                                      var photoZoomPctF = Number(frameCal && frameCal.photoZoomPct);
+                                      if (!isFinite(photoOffXmmF)) photoOffXmmF = 0;
+                                      if (!isFinite(photoOffYmmF)) photoOffYmmF = 0;
+                                      if (!isFinite(photoZoomPctF)) photoZoomPctF = 100;
+                                      var photoZoomF = photoZoomPctF / 100;
+                                      if (photoZoomF < 0.5) photoZoomF = 0.5;
+                                      if (photoZoomF > 2) photoZoomF = 2;
+                                      var photoOffXF = photoOffXmmF * PX_PER_MM_X;
+                                      var photoOffYF = photoOffYmmF * PX_PER_MM_Y;
+                                      var frameCx = SW / 2 + offXF;
+                                      var frameCy = SH / 2 + offYF;
+                                      var frameX = frameCx - frameW / 2;
+                                      var frameY = frameCy - frameH / 2;
+
+                                      // Riempi bianco, poi foto indipendente dalla cornice, cornice sopra.
+                                      ctx.fillStyle = '#ffffff';
+                                      ctx.fillRect(0, 0, SW, SH);
+                                      if (photoImg) {
+                                        var holeRect = __detectHoleRect(fImg);
+                                        var basePhX = holeRect ? (holeRect.left * SW) : 0;
+                                        var basePhY = holeRect ? (holeRect.top * SH) : 0;
+                                        var basePhW = holeRect ? (holeRect.width * SW) : SW;
+                                        var basePhH = holeRect ? (holeRect.height * SH) : SH;
+                                        var phW = basePhW * photoZoomF;
+                                        var phH = basePhH * photoZoomF;
+                                        var phX = basePhX + (basePhW - phW) / 2 + photoOffXF;
+                                        var phY = basePhY + (basePhH - phH) / 2 + photoOffYF;
+                                        try {
+                                          var piw = photoImg.naturalWidth, pih = photoImg.naturalHeight;
+                                          var pir = piw / pih, par = phW / phH;
+                                          var psx = 0, psy = 0, psw = piw, psh = pih;
+                                          if (pir > par) { psw = pih * par; psx = (piw - psw) / 2; }
+                                          else if (pir < par) { psh = piw / par; psy = (pih - psh) / 2; }
+                                          ctx.drawImage(photoImg, psx, psy, psw, psh, phX, phY, phW, phH);
+                                        } catch (_) {}
+                                      }
+                                      ctx.drawImage(fImg, frameX, frameY, frameW, frameH);
                                       var result = cvs.toDataURL('image/jpeg', 0.95);
                                       console.log('[ms] composite: done size=' + Math.round(result.length / 1024) + 'KB');
                                       resolve(result);
@@ -3287,13 +4715,53 @@ function injectSessionFrameOverlay(win, targetFrame) {
                                   try {
                                     var sw = pImg.naturalWidth, sh = pImg.naturalHeight;
                                     console.log('[ms] composite: pImg loaded ' + sw + 'x' + sh);
-                                    var ratio = SW / SH, srcRatio = sw / sh;
-                                    var sx = 0, sy = 0, cw = sw, ch = sh;
-                                    if (srcRatio > ratio) { cw = Math.round(sh * ratio); sx = Math.round((sw - cw) / 2); }
-                                    else if (srcRatio < ratio) { ch = Math.round(sw / ratio); sy = Math.round((sh - ch) / 2); }
-                                    // Mantieni orientamento identico all'anteprima mostrata all'utente.
-                                    ctx.drawImage(pImg, sx, sy, cw, ch, 0, 0, SW, SH);
-                                    drawFrame();
+                                    var __resolveCalForComposite = function() {
+                                      try {
+                                        var clampNum = function(v, min, max, fb) {
+                                          var n = parseFloat(v);
+                                          if (!isFinite(n)) n = fb;
+                                          return Math.max(min, Math.min(max, Math.round(n * 10) / 10));
+                                        };
+                                        var selectedFrame = '';
+                                        try { selectedFrame = String(localStorage.getItem('msSelectedFrameV1') || ''); } catch (_) {}
+                                        var frameKey = 'postcard::' + selectedFrame;
+                                        var framePresets = {};
+                                        var presets = {};
+                                        try { framePresets = JSON.parse(localStorage.getItem('ms-cal-frame-presets-v1') || '{}') || {}; } catch (_) { framePresets = {}; }
+                                        try { presets = JSON.parse(localStorage.getItem('ms-cal-presets-v1') || '{}') || {}; } catch (_) { presets = {}; }
+                                        var byFrame = selectedFrame ? framePresets[frameKey] : null;
+                                        var base = (byFrame && typeof byFrame === 'object') ? byFrame : (presets.postcard || null);
+                                        if (base && typeof base === 'object') {
+                                          return {
+                                            offsetXmm: clampNum(base.offsetXmm, -5, 5, 0),
+                                            offsetYmm: clampNum(base.offsetYmm, -5, 5, 0),
+                                            zoomPct: clampNum(base.zoomPct, 80, 120, 100),
+                                            photoOffsetXmm: clampNum(base.photoOffsetXmm, -5, 5, 0),
+                                            photoOffsetYmm: clampNum(base.photoOffsetYmm, -5, 5, 0),
+                                            photoZoomPct: clampNum(base.photoZoomPct, 80, 120, 100)
+                                          };
+                                        }
+                                      } catch (_) {}
+                                      try {
+                                        if (typeof window.__msGetEffectiveCalibrationForSave === 'function') {
+                                          var c = window.__msGetEffectiveCalibrationForSave('postcard');
+                                          if (c && typeof c === 'object') return c;
+                                        }
+                                      } catch (_) {}
+                                      return { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
+                                    };
+                                    var __cal = null;
+                                    try {
+                                      __cal = __resolveCalForComposite();
+                                    } catch (_) {}
+                                    var offXmm = Number(__cal && __cal.offsetXmm);
+                                    var offYmm = Number(__cal && __cal.offsetYmm);
+                                    var zoomPct = Number(__cal && __cal.zoomPct);
+                                    if (!isFinite(offXmm)) offXmm = 0;
+                                    if (!isFinite(offYmm)) offYmm = 0;
+                                    if (!isFinite(zoomPct)) zoomPct = 100;
+                                    // La foto verra' allineata in drawFrame con offset foto dedicati.
+                                    drawFrame(__cal, pImg);
                                   } catch (e) { console.log('[ms] composite pImg err: ' + e.message); resolve(dataUrl); }
                                 };
                                 pImg.onerror = function() { console.log('[ms] composite: pImg onerror'); resolve(dataUrl); };
@@ -3781,8 +5249,9 @@ function injectRemoteUiRedesign(win, targetFrame) {
       /* Vecchi pulsanti dentro al preview: nascosti, ora vivono nel topbar */
       #ms-start-btn, #ms-gallery-btn { display: none !important; }
       #ms-preview-wrap { flex: 0 0 auto; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 14px 20px 8px; }
-      #ms-preview-inner { position: relative; aspect-ratio: 2/3; height: 420px; max-height: 44vh; max-width: 100%; border-radius: 20px; overflow: hidden; background: #000; box-shadow: 0 20px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07); }
-      #ms-cam-video { width: 100%; height: 100%; object-fit: cover; display: block; transform: scaleX(-1); -webkit-transform: scaleX(-1); }
+      #ms-preview-inner { position: relative; aspect-ratio: 2/3; height: 420px; max-height: 44vh; max-width: 100%; border-radius: 20px; overflow: hidden; background: #fff; box-shadow: 0 20px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07); }
+      #ms-cam-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; transform: scaleX(-1); -webkit-transform: scaleX(-1); z-index: 1; }
+      #ms-live-mask-top, #ms-live-mask-right, #ms-live-mask-bottom, #ms-live-mask-left { position: absolute; background: #fff; z-index: 1; pointer-events: none; display: none; }
       #ms-selphy-badge { position: absolute; bottom: 52px; left: 14px; z-index: 5; background: rgba(230,57,70,0.85); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 700; color: #fff; letter-spacing: 0.07em; pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.5); box-shadow: 0 2px 10px rgba(230,57,70,0.4); }
       #ms-safe-area { position: absolute; inset: 0; z-index: 4; pointer-events: none; border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; box-shadow: none; }
       #ms-safe-area::before, #ms-safe-area::after { content: ''; position: absolute; width: 20px; height: 20px; border-color: #fff; border-style: solid; }
@@ -3918,6 +5387,9 @@ function injectRemoteUiRedesign(win, targetFrame) {
       .ms-g-item:hover, .ms-g-item.sel { border-color: rgba(255,59,92,0.72); box-shadow: 0 0 0 1px rgba(255,59,92,0.35), 0 18px 38px rgba(0,0,0,0.55), 0 0 28px rgba(255,59,92,0.16); transform: translateY(-3px) scale(1.015); }
       .ms-g-item:hover .ms-g-photo, .ms-g-item.sel .ms-g-photo { transform: scale(1.03); }
       .ms-g-id { position: absolute; top: 10px; left: 10px; padding: 4px 9px; border-radius: 999px; background: rgba(0,0,0,0.60); color: #fff; border: 1px solid rgba(255,255,255,0.16); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+      .ms-g-print-badge { position: absolute; top: 10px; right: 10px; z-index: 3; padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-shadow: 0 1px 2px rgba(0,0,0,0.75); border: 1px solid transparent; }
+      .ms-g-print-badge.printed { color: #d1fae5; background: rgba(16, 185, 129, 0.25); border-color: rgba(16, 185, 129, 0.55); }
+      .ms-g-print-badge.not-printed { color: #e5e7eb; background: rgba(75, 85, 99, 0.32); border-color: rgba(148, 163, 184, 0.46); }
       .ms-g-actions { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; display: flex; gap: 8px; padding: 10px; background: linear-gradient(transparent, rgba(0,0,0,0.74) 38%, rgba(0,0,0,0.90) 100%); }
       .ms-g-btn { flex: 1; border: 1px solid rgba(255,255,255,0.18); border-radius: 9px; background: rgba(14,14,20,0.72); color: #fff; font-size: 11px; font-weight: 700; padding: 8px 8px; cursor: pointer; transition: transform 0.2s, background 0.2s, border-color 0.2s; }
       .ms-g-btn:hover { transform: translateY(-1px); background: rgba(26,26,34,0.82); }
@@ -4617,14 +6089,14 @@ function injectRemoteUiRedesign(win, targetFrame) {
         position: relative !important;
         aspect-ratio: 2 / 3 !important;
         height: auto !important;
-        width: auto !important;
+        width: min(620px, 100%) !important;
         max-width: min(620px, 100%) !important;
         max-height: calc(100vh - 220px) !important;
         flex: 0 1 auto !important;
         min-height: 0 !important;
         border-radius: 22px !important;
         border: 1px solid rgba(255,255,255,0.10) !important;
-        background: #08090d !important;
+        background: #ffffff !important;
         overflow: hidden !important;
         box-shadow:
           0 32px 70px rgba(0,0,0,0.65),
@@ -5033,6 +6505,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
         '<div id="ms-preview-wrap">' +
           '<div id="ms-preview-inner">' +
             '<video id="ms-cam-video" autoplay muted playsinline></video>' +
+            '<div id="ms-live-mask-top"></div>' +
+            '<div id="ms-live-mask-right"></div>' +
+            '<div id="ms-live-mask-bottom"></div>' +
+            '<div id="ms-live-mask-left"></div>' +
             '<div id="ms-safe-area"><div id="ms-safe-area-br"></div><div id="ms-safe-area-tr"></div></div>' +
             '<div id="ms-safe-label">Formato Canon SELPHY 10×15</div>' +
             '<div id="ms-selphy-badge">SELPHY 10×15 · 1200×1800px</div>' +
@@ -5088,9 +6564,6 @@ function injectRemoteUiRedesign(win, targetFrame) {
                 '<div class="ms-cal-stage-toolbar">' +
                   '<div class="ms-cal-format-tabs" id="ms-cal-format-tabs">' +
                     '<button type="button" class="ms-cal-tab is-active" data-format="postcard">Postcard 10×15</button>' +
-                    '<button type="button" class="ms-cal-tab" data-format="strip">Photo Strip 5×15</button>' +
-                    '<button type="button" class="ms-cal-tab" data-format="card">Card 54×86</button>' +
-                    '<button type="button" class="ms-cal-tab" data-format="square">Square 72×72</button>' +
                   '</div>' +
                   '<div class="ms-cal-stage-tools">' +
                     '<label class="ms-cal-mini-toggle"><input type="checkbox" id="ms-cal-show-ruler" checked><span>Righelli mm</span></label>' +
@@ -5115,20 +6588,38 @@ function injectRemoteUiRedesign(win, targetFrame) {
                   '<div class="ms-cal-paper-info" id="ms-cal-paper-info">—</div>' +
                 '</div>' +
                 '<div class="ms-cal-section">' +
-                  '<div class="ms-cal-section-title">Offset</div>' +
+                  '<div class="ms-cal-section-title">Cornice</div>' +
                   '<div class="ms-cal-slider-row">' +
-                    '<div class="ms-cal-slider-label"><span>Offset X</span><span class="ms-cal-slider-val" id="ms-cal-x-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-label"><span>Offset cornice X</span><span class="ms-cal-slider-val" id="ms-cal-x-val">0.0 mm</span></div>' +
                     '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-x" min="-5" max="5" step="0.1" value="0"></div>' +
                     '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
                   '</div>' +
                   '<div class="ms-cal-slider-row">' +
-                    '<div class="ms-cal-slider-label"><span>Offset Y</span><span class="ms-cal-slider-val" id="ms-cal-y-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-label"><span>Offset cornice Y</span><span class="ms-cal-slider-val" id="ms-cal-y-val">0.0 mm</span></div>' +
                     '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-y" min="-5" max="5" step="0.1" value="0"></div>' +
                     '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
                   '</div>' +
                   '<div class="ms-cal-slider-row">' +
-                    '<div class="ms-cal-slider-label"><span>Zoom</span><span class="ms-cal-slider-val" id="ms-cal-z-val">100%</span></div>' +
+                    '<div class="ms-cal-slider-label"><span>Zoom cornice</span><span class="ms-cal-slider-val" id="ms-cal-z-val">100%</span></div>' +
                     '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-z" min="80" max="120" step="0.5" value="100"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>80</span><span>100</span><span>120</span></div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="ms-cal-section">' +
+                  '<div class="ms-cal-section-title">Foto</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Offset foto X</span><span class="ms-cal-slider-val" id="ms-cal-px-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-px" min="-5" max="5" step="0.1" value="0"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
+                  '</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Offset foto Y</span><span class="ms-cal-slider-val" id="ms-cal-py-val">0.0 mm</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-py" min="-5" max="5" step="0.1" value="0"></div>' +
+                    '<div class="ms-cal-slider-axis"><span>−5</span><span>0</span><span>+5</span></div>' +
+                  '</div>' +
+                  '<div class="ms-cal-slider-row">' +
+                    '<div class="ms-cal-slider-label"><span>Zoom foto</span><span class="ms-cal-slider-val" id="ms-cal-pz-val">100%</span></div>' +
+                    '<div class="ms-cal-slider-wrap"><input type="range" id="ms-cal-pz" min="80" max="120" step="0.5" value="100"></div>' +
                     '<div class="ms-cal-slider-axis"><span>80</span><span>100</span><span>120</span></div>' +
                   '</div>' +
                 '</div>' +
@@ -5357,10 +6848,59 @@ function injectRemoteUiRedesign(win, targetFrame) {
         if (st) {
           console.log('[ms] cam settings ' + (st.width || '?') + 'x' + (st.height || '?') + ' fps=' + (st.frameRate || '?') + ' device=' + (st.deviceId || 'n/a'));
         }
+        try {
+          var caps = track && track.getCapabilities ? track.getCapabilities() : null;
+          if (caps) {
+            var capKeys = Object.keys(caps);
+            console.log('[ms] cam capabilities=' + JSON.stringify(capKeys));
+            var lockAdvanced = [];
+            ['zoom','pan','tilt'].forEach(function(k) {
+              try {
+                var c = caps[k];
+                if (c && typeof c === 'object') {
+                  var lockVal = (typeof c.min === 'number') ? c.min : (typeof c.start === 'number' ? c.start : 0);
+                  if (k === 'zoom') lockVal = (typeof c.min === 'number') ? c.min : 1;
+                  var o = {}; o[k] = lockVal;
+                  lockAdvanced.push(o);
+                }
+              } catch (_) {}
+            });
+            try {
+              if (caps.backgroundBlur) lockAdvanced.push({ backgroundBlur: false });
+              if (caps.faceFraming || caps.autoFrame || caps.autoFraming) {
+                lockAdvanced.push({ faceFraming: false, autoFrame: false, autoFraming: false });
+              }
+              if (caps.eyeGazeCorrection) lockAdvanced.push({ eyeGazeCorrection: false });
+            } catch (_) {}
+            if (lockAdvanced.length && track.applyConstraints) {
+              track.applyConstraints({ advanced: lockAdvanced }).then(function() {
+                console.log('[ms] cam constraints LOCK applied=' + JSON.stringify(lockAdvanced));
+              }).catch(function(e) {
+                console.log('[ms] cam constraints LOCK failed: ' + (e && e.message));
+              });
+            }
+            try {
+              if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.indexOf('manual') >= 0) {
+                track.applyConstraints({ advanced: [{ focusMode: 'manual' }] }).catch(function() {});
+              }
+              if (caps.exposureMode && Array.isArray(caps.exposureMode) && caps.exposureMode.indexOf('manual') >= 0) {
+                track.applyConstraints({ advanced: [{ exposureMode: 'manual' }] }).catch(function() {});
+              }
+              if (caps.whiteBalanceMode && Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.indexOf('manual') >= 0) {
+                track.applyConstraints({ advanced: [{ whiteBalanceMode: 'manual' }] }).catch(function() {});
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
       } catch (_) {}
 
       var d = document.getElementById('ms-d-cam'); if (d) d.className = 'ms-dot online';
       var si = document.getElementById('ms-si-cam'); if (si) si.classList.add('active');
+      try {
+        setTimeout(function() {
+          try { if (typeof window.__msRefreshCalibrationPreviewSample === 'function') window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
+        }, 80);
+      } catch (_) {}
     };
 
     var startCamera = function(deviceId) {
@@ -5650,7 +7190,57 @@ function injectRemoteUiRedesign(win, targetFrame) {
     };
 
     var __msGalleryState = { items: [], index: 0, eventText: '', groups: [], slotMinutes: 30, _groupCacheKey: '', _groupCache: [] };
+    var __MS_PRINTED_PHOTOS_LS_KEY = 'msPrintedPhotosByEvent.v1';
     var __msGalleryObserver = null;
+
+    var __msGetPrintedPhotosStore = function() {
+      try {
+        var raw = localStorage.getItem(__MS_PRINTED_PHOTOS_LS_KEY);
+        var parsed = raw ? JSON.parse(raw) : {};
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+      } catch (_) {
+        return {};
+      }
+    };
+
+    var __msSavePrintedPhotosStore = function(store) {
+      try {
+        localStorage.setItem(__MS_PRINTED_PHOTOS_LS_KEY, JSON.stringify(store || {}));
+      } catch (_) {}
+    };
+
+    var __msGetPhotoPrintToken = function(item) {
+      if (!item) return '';
+      if (item.fileName) return 'f:' + String(item.fileName);
+      if (item.id) return 'i:' + String(item.id);
+      if (item.path) return 'p:' + String(item.path);
+      return '';
+    };
+
+    var __msIsPhotoPrinted = function(eventText, item) {
+      var evt = String(eventText || __msGalleryState.eventText || __msGetSelectedEventText() || 'evento_senza_nome').trim();
+      if (!evt || evt === 'evento_senza_nome') return false;
+      var token = __msGetPhotoPrintToken(item);
+      if (!token) return false;
+      var store = __msGetPrintedPhotosStore();
+      var byEvent = store[evt];
+      return !!(byEvent && byEvent[token]);
+    };
+
+    var __msSetPhotoPrinted = function(eventText, item, printed) {
+      var evt = String(eventText || __msGalleryState.eventText || __msGetSelectedEventText() || 'evento_senza_nome').trim();
+      if (!evt || evt === 'evento_senza_nome') return;
+      var token = __msGetPhotoPrintToken(item);
+      if (!token) return;
+      var store = __msGetPrintedPhotosStore();
+      if (!store[evt] || typeof store[evt] !== 'object') store[evt] = {};
+      if (printed) {
+        store[evt][token] = 1;
+      } else {
+        delete store[evt][token];
+      }
+      __msSavePrintedPhotosStore(store);
+    };
 
     // ── PRINTER STATE (single-job gating, real Windows queue monitoring) ──
     var __msPrinterState = window.__msPrinterState || { printerName: '', status: 'no-printer', label: 'Stampante', jobs: [], hasActiveJob: false, progress: 0, message: '' };
@@ -5826,36 +7416,21 @@ function injectRemoteUiRedesign(win, targetFrame) {
           sub: 'Postcard 100×150 mm · KP-108 (10×15)',
           info: 'Carta: <b>100 × 150 mm</b> (10×15)<br>Stampa: <b>full-bleed</b> (nessun margine)<br>Area utile: <b>intera superficie del foglio</b>',
           realPrint: true
-        },
-        strip: {
-          label: 'Photo Strip 5×15',
-          paper: { w: 50, h: 150 }, margin: 0, bleed: 3, safe: { w: 44, h: 144 },
-          sub: 'Photo Booth Strip 50×150 mm',
-          info: 'Carta: <b>50 × 150 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>3 mm</b> per lato<br>Safe area: <b>44 × 144 mm</b>',
-          realPrint: false
-        },
-        card: {
-          label: 'Card 54×86',
-          paper: { w: 54, h: 86 }, margin: 0, bleed: 2, safe: { w: 50, h: 82 },
-          sub: 'Card 54×86 mm',
-          info: 'Carta: <b>54 × 86 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>2 mm</b> per lato<br>Safe area: <b>50 × 82 mm</b>',
-          realPrint: false
-        },
-        square: {
-          label: 'Square 72×72',
-          paper: { w: 72, h: 72 }, margin: 0, bleed: 2, safe: { w: 68, h: 68 },
-          sub: 'Square 72×72 mm',
-          info: 'Carta: <b>72 × 72 mm</b><br>Stampa: <b>full-bleed</b><br>Tolleranza taglio: <b>2 mm</b> per lato<br>Safe area: <b>68 × 68 mm</b>',
-          realPrint: false
         }
       };
 
       var inX = document.getElementById('ms-cal-x');
       var inY = document.getElementById('ms-cal-y');
       var inZ = document.getElementById('ms-cal-z');
+      var inPX = document.getElementById('ms-cal-px');
+      var inPY = document.getElementById('ms-cal-py');
+      var inPZ = document.getElementById('ms-cal-pz');
       var valX = document.getElementById('ms-cal-x-val');
       var valY = document.getElementById('ms-cal-y-val');
       var valZ = document.getElementById('ms-cal-z-val');
+      var valPX = document.getElementById('ms-cal-px-val');
+      var valPY = document.getElementById('ms-cal-py-val');
+      var valPZ = document.getElementById('ms-cal-pz-val');
       var btnTest = document.getElementById('ms-cal-test');
       var btnSave = document.getElementById('ms-cal-save');
       var btnReset = document.getElementById('ms-cal-reset');
@@ -5878,6 +7453,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
       var previewZoom = 1.0; // 0.6 .. 1.6 (zoom anteprima — non influenza la stampa)
 
       var presetsKey = 'ms-cal-presets-v1';
+      var framePresetsKey = 'ms-cal-frame-presets-v1';
       var loadAllPresets = function() {
         try { return JSON.parse(localStorage.getItem(presetsKey) || '{}') || {}; } catch (_) { return {}; }
       };
@@ -5886,30 +7462,279 @@ function injectRemoteUiRedesign(win, targetFrame) {
       };
       var getPreset = function(fmt) {
         var all = loadAllPresets();
-        return all[fmt] || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100 };
+        return all[fmt] || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
       };
       var setPreset = function(fmt, cal) {
         var all = loadAllPresets();
-        all[fmt] = { offsetXmm: cal.offsetXmm, offsetYmm: cal.offsetYmm, zoomPct: cal.zoomPct };
+        all[fmt] = {
+          offsetXmm: cal.offsetXmm,
+          offsetYmm: cal.offsetYmm,
+          zoomPct: cal.zoomPct,
+          photoOffsetXmm: cal.photoOffsetXmm,
+          photoOffsetYmm: cal.photoOffsetYmm,
+          photoZoomPct: cal.photoZoomPct
+        };
         saveAllPresets(all);
+      };
+      var loadAllFramePresets = function() {
+        try { return JSON.parse(localStorage.getItem(framePresetsKey) || '{}') || {}; } catch (_) { return {}; }
+      };
+      var saveAllFramePresets = function(p) {
+        try { localStorage.setItem(framePresetsKey, JSON.stringify(p || {})); } catch (_) {}
+      };
+      var buildFramePresetKey = function(fmt, frameName) {
+        return String(fmt || '') + '::' + String(frameName || '');
+      };
+      var getCurrentFrameName = function() {
+        try {
+          if (typeof getSelectedFrameName === 'function') return String(getSelectedFrameName() || '');
+        } catch (_) {}
+        return '';
+      };
+      var getFramePreset = function(fmt, frameName) {
+        if (!frameName) return null;
+        var all = loadAllFramePresets();
+        var p = all[buildFramePresetKey(fmt, frameName)];
+        if (!p || typeof p !== 'object') return null;
+        return {
+          offsetXmm: clamp(p.offsetXmm, -5, 5, 0),
+          offsetYmm: clamp(p.offsetYmm, -5, 5, 0),
+          zoomPct: clamp(p.zoomPct, 80, 120, 100),
+          photoOffsetXmm: clamp(p.photoOffsetXmm, -5, 5, 0),
+          photoOffsetYmm: clamp(p.photoOffsetYmm, -5, 5, 0),
+          photoZoomPct: clamp(p.photoZoomPct, 80, 120, 100)
+        };
+      };
+      var setFramePreset = function(fmt, frameName, cal) {
+        if (!frameName) return;
+        var all = loadAllFramePresets();
+        all[buildFramePresetKey(fmt, frameName)] = {
+          offsetXmm: cal.offsetXmm,
+          offsetYmm: cal.offsetYmm,
+          zoomPct: cal.zoomPct,
+          photoOffsetXmm: cal.photoOffsetXmm,
+          photoOffsetYmm: cal.photoOffsetYmm,
+          photoZoomPct: cal.photoZoomPct
+        };
+        saveAllFramePresets(all);
+      };
+      var getEffectivePreset = function(fmt, fallback) {
+        var frameName = getCurrentFrameName();
+        var byFrame = getFramePreset(fmt, frameName);
+        if (byFrame) return byFrame;
+        if (fallback && typeof fallback === 'object') {
+          return {
+            offsetXmm: clamp(fallback.offsetXmm, -5, 5, 0),
+            offsetYmm: clamp(fallback.offsetYmm, -5, 5, 0),
+            zoomPct: clamp(fallback.zoomPct, 80, 120, 100),
+            photoOffsetXmm: clamp(fallback.photoOffsetXmm, -5, 5, 0),
+            photoOffsetYmm: clamp(fallback.photoOffsetYmm, -5, 5, 0),
+            photoZoomPct: clamp(fallback.photoZoomPct, 80, 120, 100)
+          };
+        }
+        return getPreset(fmt);
+      };
+      var calDefaultPreviewRect = (typeof __msDefaultPreviewRect !== 'undefined' && __msDefaultPreviewRect) ? __msDefaultPreviewRect : { left: 0.0767, top: 0.0615, width: 0.8466, height: 0.7812 };
+      var normalizeCalibrationPhotoRect = function(rect, fallback) {
+        try {
+          var fb = fallback || calDefaultPreviewRect || { left: 0, top: 0, width: 1, height: 1 };
+          var source = (rect && typeof rect === 'object') ? rect : fb;
+          var clamp01 = function(v) {
+            var n = Number(v);
+            if (!isFinite(n)) return 0;
+            return Math.max(0, Math.min(1, n));
+          };
+          var width = clamp01(source.width);
+          var height = clamp01(source.height);
+          if (width <= 0 || height <= 0) {
+            width = clamp01(fb.width);
+            height = clamp01(fb.height);
+          }
+          return {
+            left: clamp01((1 - width) / 2),
+            top: clamp01((1 - height) / 2),
+            width: width,
+            height: height
+          };
+        } catch (_) {
+          return fallback || calDefaultPreviewRect || null;
+        }
+      };
+
+      var applyLivePreviewCalibration = function(cal) {
+        try {
+          var inner = document.getElementById('ms-preview-inner');
+          var video = document.getElementById('ms-cam-video');
+          var frameOv = document.getElementById('ms-frame-ov');
+          var maskTop = document.getElementById('ms-live-mask-top');
+          var maskRight = document.getElementById('ms-live-mask-right');
+          var maskBottom = document.getElementById('ms-live-mask-bottom');
+          var maskLeft = document.getElementById('ms-live-mask-left');
+          if (!inner || !video || !frameOv || !maskTop || !maskRight || !maskBottom || !maskLeft) return;
+
+          var hasFrame = !!(frameOv.src && String(frameOv.src || '').trim());
+          if (!hasFrame) {
+            video.style.inset = '0px';
+            video.style.left = '0px';
+            video.style.top = '0px';
+            video.style.width = '100%';
+            video.style.height = '100%';
+            frameOv.style.left = '0px';
+            frameOv.style.top = '0px';
+            frameOv.style.width = '100%';
+            frameOv.style.height = '100%';
+            [maskTop, maskRight, maskBottom, maskLeft].forEach(function(m) {
+              m.style.display = 'none';
+            });
+            return;
+          }
+
+          var c = cal;
+          if (!c || typeof c !== 'object') c = getEffectivePreset('postcard', getPreset('postcard'));
+
+          var offXmm = clamp(c && c.offsetXmm, -5, 5, 0);
+          var offYmm = clamp(c && c.offsetYmm, -5, 5, 0);
+          var zoomPct = clamp(c && c.zoomPct, 80, 120, 100);
+          var photoOffXmm = clamp(c && c.photoOffsetXmm, -5, 5, 0);
+          var photoOffYmm = clamp(c && c.photoOffsetYmm, -5, 5, 0);
+          var photoZoomPct = clamp(c && c.photoZoomPct, 80, 120, 100);
+          var zoom = zoomPct / 100;
+          var photoZoom = photoZoomPct / 100;
+          if (zoom < 0.5) zoom = 0.5;
+          if (zoom > 2) zoom = 2;
+          if (photoZoom < 0.5) photoZoom = 0.5;
+          if (photoZoom > 2) photoZoom = 2;
+
+          var w = inner.clientWidth || 0;
+          var h = inner.clientHeight || 0;
+          if (!w || !h) return;
+
+          var offX = (offXmm / 100) * w;
+          var offY = (offYmm / 150) * h;
+          var frameW = w * zoom;
+          var frameH = h * zoom;
+          var frameX = (w - frameW) / 2 + offX;
+          var frameY = (h - frameH) / 2 + offY;
+          var photoOffX = (photoOffXmm / 100) * w;
+          var photoOffY = (photoOffYmm / 150) * h;
+          var livePhotoHole = normalizeCalibrationPhotoRect(frameOverlayHole || (hasFrame ? calDefaultPreviewRect : null), calDefaultPreviewRect);
+          var basePhotoX = livePhotoHole ? (livePhotoHole.left * w) : 0;
+          var basePhotoY = livePhotoHole ? (livePhotoHole.top * h) : 0;
+          var basePhotoW = livePhotoHole ? (livePhotoHole.width * w) : w;
+          var basePhotoH = livePhotoHole ? (livePhotoHole.height * h) : h;
+          var photoW = basePhotoW * photoZoom;
+          var photoH = basePhotoH * photoZoom;
+          var photoX = basePhotoX + (basePhotoW - photoW) / 2 + photoOffX;
+          var photoY = basePhotoY + (basePhotoH - photoH) / 2 + photoOffY;
+
+          // Video allineato alla calibrazione Foto, separata dalla cornice.
+          try { inner.style.background = '#000000'; } catch (_) {}
+          video.style.inset = 'auto';
+          video.style.left = photoX + 'px';
+          video.style.top = photoY + 'px';
+          video.style.width = photoW + 'px';
+          video.style.height = photoH + 'px';
+          video.style.zIndex = '1';
+
+          frameOv.style.inset = 'auto';
+          frameOv.style.left = frameX + 'px';
+          frameOv.style.top = frameY + 'px';
+          frameOv.style.width = frameW + 'px';
+          frameOv.style.height = frameH + 'px';
+          frameOv.style.zIndex = '3';
+
+          // Nel pannello la camera e' un elemento DOM: mascheriamo tutto cio'
+          // che sta fuori dal foro foto, come fa il canvas di calibrazione.
+          var left = Math.max(0, Math.min(w, photoX));
+          var top = Math.max(0, Math.min(h, photoY));
+          var right = Math.max(0, Math.min(w, photoX + photoW));
+          var bottom = Math.max(0, Math.min(h, photoY + photoH));
+          var visW = Math.max(0, right - left);
+          var visH = Math.max(0, bottom - top);
+
+          if (visW < 8 || visH < 8) {
+            [maskTop, maskRight, maskBottom, maskLeft].forEach(function(m) {
+              m.style.display = 'none';
+            });
+            return;
+          }
+
+          maskTop.style.display = 'block';
+          maskTop.style.background = '#000000';
+          maskTop.style.zIndex = '2';
+          maskTop.style.left = '0px';
+          maskTop.style.top = '0px';
+          maskTop.style.width = w + 'px';
+          maskTop.style.height = top + 'px';
+
+          maskBottom.style.display = 'block';
+          maskBottom.style.background = '#000000';
+          maskBottom.style.zIndex = '2';
+          maskBottom.style.left = '0px';
+          maskBottom.style.top = bottom + 'px';
+          maskBottom.style.width = w + 'px';
+          maskBottom.style.height = Math.max(0, h - bottom) + 'px';
+
+          maskLeft.style.display = 'block';
+          maskLeft.style.background = '#000000';
+          maskLeft.style.zIndex = '2';
+          maskLeft.style.left = '0px';
+          maskLeft.style.top = top + 'px';
+          maskLeft.style.width = left + 'px';
+          maskLeft.style.height = visH + 'px';
+
+          maskRight.style.display = 'block';
+          maskRight.style.background = '#000000';
+          maskRight.style.zIndex = '2';
+          maskRight.style.left = right + 'px';
+          maskRight.style.top = top + 'px';
+          maskRight.style.width = Math.max(0, w - right) + 'px';
+          maskRight.style.height = visH + 'px';
+        } catch (_) {}
+      };
+      window.__msApplyLivePreviewCalibration = applyLivePreviewCalibration;
+
+      window.__msGetEffectiveCalibrationForSave = function(fmt, frameName) {
+        try {
+          var f = String(fmt || 'postcard');
+          var name = (frameName === undefined || frameName === null) ? getCurrentFrameName() : String(frameName || '');
+          var byFrame = getFramePreset(f, name);
+          if (byFrame) return byFrame;
+          if (f === 'postcard' && window.electronAPI && typeof window.electronAPI.getPrintCalibration === 'function') {
+            // API async: in questo contesto ritorniamo il preset locale sincrono.
+            return getPreset('postcard');
+          }
+          return getPreset(f);
+        } catch (_) {
+          return { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
+        }
       };
 
       var readUI = function() {
         return {
           offsetXmm: clamp(inX && inX.value, -5, 5, 0),
           offsetYmm: clamp(inY && inY.value, -5, 5, 0),
-          zoomPct:   clamp(inZ && inZ.value, 80, 120, 100)
+          zoomPct:   clamp(inZ && inZ.value, 80, 120, 100),
+          photoOffsetXmm: clamp(inPX && inPX.value, -5, 5, 0),
+          photoOffsetYmm: clamp(inPY && inPY.value, -5, 5, 0),
+          photoZoomPct: clamp(inPZ && inPZ.value, 80, 120, 100)
         };
       };
       var writeUI = function(c) {
         try {
-          c = c || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100 };
+          c = c || { offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 };
           if (inX) inX.value = String(c.offsetXmm || 0);
           if (inY) inY.value = String(c.offsetYmm || 0);
           if (inZ) inZ.value = String(c.zoomPct || 100);
+          if (inPX) inPX.value = String(c.photoOffsetXmm || 0);
+          if (inPY) inPY.value = String(c.photoOffsetYmm || 0);
+          if (inPZ) inPZ.value = String(c.photoZoomPct || 100);
           if (valX) valX.textContent = (c.offsetXmm || 0).toFixed(1) + ' mm';
           if (valY) valY.textContent = (c.offsetYmm || 0).toFixed(1) + ' mm';
           if (valZ) valZ.textContent = Math.round(c.zoomPct || 100) + '%';
+          if (valPX) valPX.textContent = (c.photoOffsetXmm || 0).toFixed(1) + ' mm';
+          if (valPY) valPY.textContent = (c.photoOffsetYmm || 0).toFixed(1) + ' mm';
+          if (valPZ) valPZ.textContent = Math.round(c.photoZoomPct || 100) + '%';
         } catch (_) {}
       };
       var refreshSliderLabels = function() {
@@ -5917,19 +7742,42 @@ function injectRemoteUiRedesign(win, targetFrame) {
         if (valX) valX.textContent = c.offsetXmm.toFixed(1) + ' mm';
         if (valY) valY.textContent = c.offsetYmm.toFixed(1) + ' mm';
         if (valZ) valZ.textContent = Math.round(c.zoomPct) + '%';
+        if (valPX) valPX.textContent = c.photoOffsetXmm.toFixed(1) + ' mm';
+        if (valPY) valPY.textContent = c.photoOffsetYmm.toFixed(1) + ' mm';
+        if (valPZ) valPZ.textContent = Math.round(c.photoZoomPct) + '%';
+        applyLivePreviewCalibration(c);
       };
 
       // ── Sample image (foto reale per anteprima) ───────────────────
       var sampleImg = null, sampleReady = false;
+      var frameOverlayImg = null, frameOverlayReady = false;
+      var frameOverlayHole = null; // {left, top, width, height} in [0..1] rel a frameOverlayImg
+
+      var __msDetectHoleRect = function(img) {
+        try {
+          var rect = null;
+          if (typeof __msComputeTransparentRectFromImage === 'function') {
+            rect = __msComputeTransparentRectFromImage(img);
+          }
+          return normalizeCalibrationPhotoRect(rect, calDefaultPreviewRect);
+        } catch (_) { return null; }
+      };
       var loadSample = function() {
         try {
           var src = '';
-          // Priorita' 1: cornice attualmente selezionata in preview
+          // Priorita' 1: ultimo scatto disponibile
           if (!src) {
-            var fr = document.getElementById('ms-frame-ov') || document.querySelector('img[id^="ms-frame"]');
-            if (fr && fr.src) src = fr.src;
+            try {
+              var lp = String(localStorage.getItem('last_picture_url') || '').trim();
+              if (lp && !/cursor_(cancel|ok)\.png/i.test(lp)) src = lp;
+            } catch (_) {}
           }
-          // Priorita' 2: ultima foto galleria (fallback)
+          // Priorita' 2: preview foto corrente
+          if (!src) {
+            var pm = document.getElementById('ms-preview-main');
+            if (pm && pm.src && pm.src.indexOf('data:image/') === 0) src = pm.src;
+          }
+          // Priorita' 3: ultima foto galleria (fallback)
           if (!src && window.__msGalleryState && Array.isArray(window.__msGalleryState.items) && window.__msGalleryState.items.length) {
             var it = window.__msGalleryState.items[0];
             if (it && it.path) src = (typeof window.__msToLocalImageUrl === 'function') ? window.__msToLocalImageUrl(it.path) : ('file:///' + String(it.path).replace(/\\\\/g, '/'));
@@ -5940,6 +7788,39 @@ function injectRemoteUiRedesign(win, targetFrame) {
           im.onerror = function() { sampleReady = false; };
           im.src = src;
         } catch (_) {}
+      };
+      var loadFrameOverlaySample = function() {
+        try {
+          var src = '';
+          try {
+            var ov = document.getElementById('ms-frame-ov');
+            if (ov && ov.src) src = String(ov.src || '').trim();
+          } catch (_) {}
+          if (!src) {
+            try {
+              if (typeof window.__msResolveFrameUrl === 'function') src = String(window.__msResolveFrameUrl() || '').trim();
+            } catch (_) {}
+          }
+          if (!src) {
+            frameOverlayImg = null;
+            frameOverlayReady = false;
+            frameOverlayHole = null;
+            return;
+          }
+          frameOverlayHole = calDefaultPreviewRect || null;
+          var fim = new Image();
+          fim.onload = function() {
+            frameOverlayImg = fim;
+            frameOverlayReady = true;
+            try { frameOverlayHole = __msDetectHoleRect(fim); } catch (_) { frameOverlayHole = null; }
+            renderPreview();
+          };
+          fim.onerror = function() { frameOverlayImg = null; frameOverlayReady = false; frameOverlayHole = null; renderPreview(); };
+          fim.src = src;
+        } catch (_) {
+          frameOverlayImg = null;
+          frameOverlayReady = false;
+        }
       };
 
       var drawPlaceholder = function(c, x, y, w, h) {
@@ -6031,35 +7912,58 @@ function injectRemoteUiRedesign(win, targetFrame) {
         var safeX = px + (paperW - safeW) / 2;
         var safeY = py + (paperH - safeH) / 2;
 
-        // Foto: zoom PROPORZIONALE (X e Y scalano insieme) + offset centrato,
-        // cosi' la proporzione della foto resta sempre la stessa.
-        // Mirror esatto di ms-direct-print.ps1 ramo full-bleed.
+        // Calibrazione applicata alla CORNICE (non alla foto).
         var offX = cal.offsetXmm * pxPerMm;
         var offY = cal.offsetYmm * pxPerMm;
         var zoom = cal.zoomPct / 100; if (zoom < 0.5) zoom = 0.5; if (zoom > 2) zoom = 2;
-        var fw = paperW * zoom;
-        var fh = paperH * zoom;
-        var fcx = px + paperW / 2 + offX;
-        var fcy = py + paperH / 2 + offY;
-        var fx = fcx - fw / 2;
-        var fy = fcy - fh / 2;
+        var frameW = paperW * zoom;
+        var frameH = paperH * zoom;
+        var frameCx = px + paperW / 2 + offX;
+        var frameCy = py + paperH / 2 + offY;
+        var frameX = frameCx - frameW / 2;
+        var frameY = frameCy - frameH / 2;
+        var fw = paperW;
+        var fh = paperH;
+        var fx = px;
+        var fy = py;
 
         // Clip al foglio
         ctx.save();
         roundRect(px, py, paperW, paperH, radius);
         ctx.clip();
 
+        // Sfondo foglio bianco (così fuori cornice resta bianco)
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(px, py, paperW, paperH);
+
+        // Foto: usa SOLO i controlli Foto, indipendenti dalla cornice.
+        var photoOffX = cal.photoOffsetXmm * pxPerMm;
+        var photoOffY = cal.photoOffsetYmm * pxPerMm;
+        var photoZoom = cal.photoZoomPct / 100; if (photoZoom < 0.5) photoZoom = 0.5; if (photoZoom > 2) photoZoom = 2;
+        var previewPhotoHole = normalizeCalibrationPhotoRect(frameOverlayHole || (frameOverlayReady ? calDefaultPreviewRect : null), calDefaultPreviewRect);
+        var basePhX = px + (previewPhotoHole ? previewPhotoHole.left * paperW : 0);
+        var basePhY = py + (previewPhotoHole ? previewPhotoHole.top * paperH : 0);
+        var basePhW = previewPhotoHole ? previewPhotoHole.width * paperW : paperW;
+        var basePhH = previewPhotoHole ? previewPhotoHole.height * paperH : paperH;
+        var phW = basePhW * photoZoom;
+        var phH = basePhH * photoZoom;
+        var phX = basePhX + (basePhW - phW) / 2 + photoOffX;
+        var phY = basePhY + (basePhH - phH) / 2 + photoOffY;
+
         if (sampleReady && sampleImg) {
-          // IDENTICO a ms-direct-print.ps1 ramo "full-bleed":
-          //   cover su pageW*zoom × pageH*zoom centrato + offset
+          // Cover: riempie tutto il foro, croppa per mantenere proporzioni.
           var iw = sampleImg.naturalWidth, ih = sampleImg.naturalHeight;
-          var ir = iw / ih, ar = fw / fh;
+          var ir = iw / ih, ar2 = phW / phH;
           var sx = 0, sy = 0, sw = iw, sh = ih;
-          if (ir > ar) { sw = ih * ar; sx = (iw - sw) / 2; }
-          else if (ir < ar) { sh = iw / ar; sy = (ih - sh) / 2; }
-          ctx.drawImage(sampleImg, sx, sy, sw, sh, fx, fy, fw, fh);
+          if (ir > ar2) { sw = ih * ar2; sx = (iw - sw) / 2; }
+          else if (ir < ar2) { sh = iw / ar2; sy = (ih - sh) / 2; }
+          ctx.drawImage(sampleImg, sx, sy, sw, sh, phX, phY, phW, phH);
         } else {
-          drawPlaceholder(ctx, fx, fy, fw, fh);
+          drawPlaceholder(ctx, phX, phY, phW, phH);
+        }
+
+        if (frameOverlayReady && frameOverlayImg) {
+          try { ctx.drawImage(frameOverlayImg, frameX, frameY, frameW, frameH); } catch (_) {}
         }
 
         ctx.restore(); // end clip foglio
@@ -6104,10 +8008,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
           ctx.restore();
         }
 
-        // Croce centrale (riferimento centro foto)
+        // Croce centrale (riferimento centro cornice)
         ctx.strokeStyle = 'rgba(0,0,0,0.55)';
         ctx.lineWidth = 1;
-        var ccx = px + paperW / 2 + offX, ccy = py + paperH / 2 + offY;
+        var ccx = frameCx, ccy = frameCy;
         var cl = Math.max(8, 6 * pxPerMm);
         ctx.beginPath();
         ctx.moveTo(ccx - cl, ccy); ctx.lineTo(ccx + cl, ccy);
@@ -6149,11 +8053,12 @@ function injectRemoteUiRedesign(win, targetFrame) {
         ctx.fillStyle = 'rgba(0,0,0,0.78)'; ctx.font = '11px Arial';
         ctx.textAlign = 'left'; ctx.textBaseline = 'top';
         ctx.fillText(
-          fmt.label + '  ·  X ' + cal.offsetXmm + 'mm  Y ' + cal.offsetYmm + 'mm  Z ' + cal.zoomPct + '%',
+          fmt.label + '  ·  X ' + cal.offsetXmm + 'mm  Y ' + cal.offsetYmm + 'mm  Z ' + cal.zoomPct + '%  ·  FotoX ' + cal.photoOffsetXmm + 'mm  FotoY ' + cal.photoOffsetYmm + 'mm  FotoZ ' + cal.photoZoomPct + '%',
           px + 6, py + 6
         );
 
         lastGeom = { px: px, py: py, paperW: paperW, paperH: paperH, pxPerMm: pxPerMm, fmt: fmt };
+        try { applyLivePreviewCalibration(cal); } catch (_) {}
       };
 
       var applyFormat = function(fmt, opts) {
@@ -6166,25 +8071,25 @@ function injectRemoteUiRedesign(win, targetFrame) {
         if (fmt === 'postcard' && opts.useBackend) {
           if (window.electronAPI && typeof window.electronAPI.getPrintCalibration === 'function') {
             window.electronAPI.getPrintCalibration().then(function(c) {
-              writeUI(c || getPreset('postcard'));
+              writeUI(getEffectivePreset('postcard', c || getPreset('postcard')));
               setStatus('Calibrazione caricata');
               renderPreview();
             }).catch(function() {
-              writeUI(getPreset('postcard'));
+              writeUI(getEffectivePreset('postcard', getPreset('postcard')));
               setStatus('Impossibile leggere calibrazione, uso preset locale');
               renderPreview();
             });
             return;
           }
         }
-        writeUI(getPreset(fmt));
+        writeUI(getEffectivePreset(fmt, getPreset(fmt)));
         if (def && !def.realPrint) setStatus('Preset visivo (stampa reale solo Postcard CP1500)');
         else setStatus('Preset caricato');
         renderPreview();
       };
 
       // ── Wiring sliders ────────────────────────────────────────────
-      [inX, inY, inZ].forEach(function(el) {
+      [inX, inY, inZ, inPX, inPY, inPZ].forEach(function(el) {
         if (!el) return;
         el.addEventListener('input', function() { refreshSliderLabels(); setStatus('Modifica non salvata'); renderPreview(); });
         el.addEventListener('change', function() { refreshSliderLabels(); renderPreview(); });
@@ -6243,21 +8148,34 @@ function injectRemoteUiRedesign(win, targetFrame) {
           ro.observe(stageEl);
         }
       } catch (_) {}
-      window.addEventListener('resize', renderPreview);
+      window.addEventListener('resize', function() { renderPreview(); applyLivePreviewCalibration(); });
 
       // ── Salva ─────────────────────────────────────────────────────
       if (btnSave) btnSave.addEventListener('click', function() {
         var cal = readUI();
         // Sempre persiste il preset locale per il formato corrente
         setPreset(currentFormat, cal);
+        setFramePreset(currentFormat, getCurrentFrameName(), cal);
         var fmtDef = FORMATS[currentFormat];
         if (fmtDef && fmtDef.realPrint && window.electronAPI && typeof window.electronAPI.setPrintCalibration === 'function') {
           // Solo postcard tocca la calibrazione di stampa reale (usata da galleria + post-scatto)
           btnSave.disabled = true;
-          window.electronAPI.setPrintCalibration(cal).then(function(res) {
+          var frameOnlyCal = { offsetXmm: cal.offsetXmm, offsetYmm: cal.offsetYmm, zoomPct: cal.zoomPct };
+          window.electronAPI.setPrintCalibration(frameOnlyCal).then(function(res) {
             btnSave.disabled = false;
             if (res && res.success) {
-              writeUI(res.calibration || cal);
+              var normalized = res.calibration || frameOnlyCal;
+              var merged = {
+                offsetXmm: clamp(normalized.offsetXmm, -5, 5, cal.offsetXmm),
+                offsetYmm: clamp(normalized.offsetYmm, -5, 5, cal.offsetYmm),
+                zoomPct: clamp(normalized.zoomPct, 80, 120, cal.zoomPct),
+                photoOffsetXmm: cal.photoOffsetXmm,
+                photoOffsetYmm: cal.photoOffsetYmm,
+                photoZoomPct: cal.photoZoomPct
+              };
+              writeUI(merged);
+              setPreset(currentFormat, merged);
+              setFramePreset(currentFormat, getCurrentFrameName(), merged);
               setStatus('Preset salvato (applicato a stampa galleria + post-scatto)');
               try { showToast('Calibrazione salvata', 1600, '#22c55e'); } catch (_) {}
             } else {
@@ -6275,7 +8193,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
 
       // ── Reset ─────────────────────────────────────────────────────
       if (btnReset) btnReset.addEventListener('click', function() {
-        writeUI({ offsetXmm: 0, offsetYmm: 0, zoomPct: 100 });
+        writeUI({ offsetXmm: 0, offsetYmm: 0, zoomPct: 100, photoOffsetXmm: 0, photoOffsetYmm: 0, photoZoomPct: 100 });
         setStatus('Valori resettati (non salvati)');
         renderPreview();
       });
@@ -6314,11 +8232,14 @@ function injectRemoteUiRedesign(win, targetFrame) {
       // Espone refresh pubblico: utile quando l'utente cambia cornice.
       window.__msRefreshCalibrationPreviewSample = function() {
         try { loadSample(); } catch (_) {}
+        try { loadFrameOverlaySample(); } catch (_) {}
         try { renderPreview(); } catch (_) {}
+        try { applyLivePreviewCalibration(); } catch (_) {}
       };
 
       // ── Bootstrap ─────────────────────────────────────────────────
       loadSample();
+      loadFrameOverlaySample();
       applyFormat('postcard', { useBackend: true });
     };
 
@@ -6414,6 +8335,9 @@ function injectRemoteUiRedesign(win, targetFrame) {
       }).then(function(res) {
         if (!res) return;
         if (res && res.success) {
+          __msSetPhotoPrinted(evtToken, item, true);
+          item.__printed = true;
+          __msRenderGallery();
           showToast('Stampa avviata', 1800, '#22c55e');
         } else if (res && res.busy) {
           showToast('Stampante occupata: attendi…', 2200, '#facc15');
@@ -6624,14 +8548,18 @@ function injectRemoteUiRedesign(win, targetFrame) {
         grid.innerHTML = '';
         if (chips) chips.innerHTML = '';
         empty.style.display = 'block';
-        count.textContent = '0 foto · 0 fasce orarie';
+        count.textContent = '0 foto · 0 fasce orarie · 0 stampate';
         return;
       }
 
       var groups = __msBuildGalleryGroups(__msGalleryState.items);
+      var printedCount = __msGalleryState.items.reduce(function(acc, photo) {
+        if (!photo) return acc;
+        return acc + ((photo.__printed || __msIsPhotoPrinted(__msGalleryState.eventText, photo)) ? 1 : 0);
+      }, 0);
       __msGalleryState.groups = groups;
       empty.style.display = 'none';
-      count.textContent = String(total) + ' foto · ' + String(groups.length) + ' fasce orarie';
+      count.textContent = String(total) + ' foto · ' + String(groups.length) + ' fasce orarie · ' + String(printedCount) + ' stampate';
       __msRenderGalleryChips(groups);
 
       grid.innerHTML = '';
@@ -6695,6 +8623,11 @@ function injectRemoteUiRedesign(win, targetFrame) {
           idBadge.className = 'ms-g-id';
           idBadge.textContent = 'ID ' + String(item.id || '----');
 
+          var printBadge = document.createElement('div');
+          var isPrinted = !!item.__printed;
+          printBadge.className = 'ms-g-print-badge ' + (isPrinted ? 'printed' : 'not-printed');
+          printBadge.textContent = isPrinted ? 'Stampata' : 'Non stampata';
+
           var actions = document.createElement('div');
           actions.className = 'ms-g-actions';
 
@@ -6722,6 +8655,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           mediaWrap.appendChild(im);
           card.appendChild(mediaWrap);
           card.appendChild(idBadge);
+          card.appendChild(printBadge);
           card.appendChild(actions);
           card.addEventListener('mouseenter', function() {
             __msSetSelectedGalleryIndex(idx, card);
@@ -6795,8 +8729,12 @@ function injectRemoteUiRedesign(win, targetFrame) {
           showToast('Errore eliminazione foto', 2500);
           return;
         }
+        __msSetPhotoPrinted(__msGalleryState.eventText || __msGetSelectedEventText(), item, false);
         __msLoadEventPhotos(__msGalleryState.eventText || __msGetSelectedEventText()).then(function(newRes) {
           __msGalleryState.items = (newRes && Array.isArray(newRes.photos)) ? newRes.photos : [];
+          __msGalleryState.items.forEach(function(photo) {
+            photo.__printed = __msIsPhotoPrinted(__msGalleryState.eventText, photo);
+          });
           if (__msGalleryState.index >= __msGalleryState.items.length) __msGalleryState.index = Math.max(0, __msGalleryState.items.length - 1);
           __msRenderGallery();
           __msRenderGalleryViewer();
@@ -6851,6 +8789,9 @@ function injectRemoteUiRedesign(win, targetFrame) {
       if (skelCount) skelCount.textContent = 'Caricamento timeline…';
       __msLoadEventPhotos(evtTxt).then(function(res) {
         __msGalleryState.items = (res && Array.isArray(res.photos)) ? res.photos : [];
+        __msGalleryState.items.forEach(function(photo) {
+          photo.__printed = __msIsPhotoPrinted(evtTxt, photo);
+        });
         __msGalleryState.index = 0;
         __msGalleryState.eventText = evtTxt;
         __msGalleryState._groupCacheKey = '';
@@ -7164,6 +9105,17 @@ function injectRemoteUiRedesign(win, targetFrame) {
       img.src = tempUrl;
     };
 
+    var refreshPanelFramePreview = function() {
+      try {
+        if (typeof window.__msRefreshCalibrationPreviewSample === 'function') {
+          window.__msRefreshCalibrationPreviewSample();
+          setTimeout(function() {
+            try { window.__msRefreshCalibrationPreviewSample(); } catch (_) {}
+          }, 80);
+        }
+      } catch (_) {}
+    };
+
     var refreshFrames = function() {
       var grid = document.getElementById('ms-frames-grid'); if (!grid) return;
       var items = findFrameItems();
@@ -7199,6 +9151,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           item.classList.add('sel'); img.click();
           var ov = document.getElementById('ms-frame-ov');
           if (ov) { ov.src = img.src; ov.style.display = 'block'; }
+          refreshPanelFramePreview();
         });
         del.addEventListener('click', function(e) {
           e.stopPropagation();
@@ -7208,11 +9161,12 @@ function injectRemoteUiRedesign(win, targetFrame) {
       });
       if (items.length && !grid.querySelector('.ms-fi.sel')) {
         var first = grid.querySelector('.ms-fi');
-        if (first) { first.classList.add('sel'); var ov2 = document.getElementById('ms-frame-ov'); if (ov2) { ov2.src = first.dataset.s; ov2.style.display = 'block'; } }
+        if (first) { first.classList.add('sel'); var ov2 = document.getElementById('ms-frame-ov'); if (ov2) { ov2.src = first.dataset.s; ov2.style.display = 'block'; } refreshPanelFramePreview(); }
       }
       if (!items.length && !(window._msLocalFrames && window._msLocalFrames.length)) {
         var ov3 = document.getElementById('ms-frame-ov');
         if (ov3) ov3.style.display = 'none';
+        refreshPanelFramePreview();
       }
       if (window._msLocalFrames && window._msLocalFrames.length) {
         renderLocalFrames();
@@ -9187,3 +11141,5 @@ app.on('activate', () => {
         createWindow();
     }
 });
+
+
