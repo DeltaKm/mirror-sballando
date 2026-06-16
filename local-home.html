@@ -18,15 +18,7 @@
   <!-- Stub legacy: il pannello custom ms-app legge eventi/tempi/checkbox da qui. -->
   <div id="legacy-controls">
     <select name="event_selected" id="event_selected">
-      <option value="" selected>-- Seleziona un evento --</option>
-      <option value="1">Evento Demo 1 (01/01/2025 20:00)</option>
-      <option value="2">Matrimonio Rossi (15/02/2025 18:00)</option>
-      <option value="3">18 Anni Bianchi (10/03/2025 21:00)</option>
-      <option value="4">Festa Aziendale ACME (22/04/2025 19:30)</option>
-      <option value="5">Compleanno Verdi (05/05/2025 17:00)</option>
-      <option value="6">Battesimo Russo (20/06/2025 11:00)</option>
-      <option value="7">Comunione Esposito (07/07/2025 13:00)</option>
-      <option value="8">Capodanno 2026 (31/12/2025 22:00)</option>
+      <option value="" selected>Caricamento eventi...</option>
     </select>
 
     <select name="count_down_selected" id="count_down_selected">
@@ -185,6 +177,56 @@
       }
       window.addEventListener('pointerdown', unlockAudio, { once: false, capture: true });
       window.addEventListener('keydown', unlockAudio, { once: false, capture: true });
+
+      // Eventi: il pannello custom legge questo select legacy.
+      // Lo popoliamo dal main process, che accede al server SFTP.
+      function setEventOptions(items, message) {
+        var sel = document.getElementById('event_selected');
+        if (!sel) return;
+        sel.innerHTML = '';
+
+        var first = document.createElement('option');
+        first.value = '';
+        first.textContent = message || '-- Seleziona un evento --';
+        first.selected = true;
+        sel.appendChild(first);
+
+        if (Array.isArray(items)) {
+          items.forEach(function (item) {
+            if (!item) return;
+            var title = String(item.title || item.name || item.id || '').trim();
+            if (!title) return;
+            var opt = document.createElement('option');
+            opt.value = String(item.id || item.name || title);
+            opt.textContent = title;
+            sel.appendChild(opt);
+          });
+        }
+
+        try { sel.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+      }
+
+      function loadSftpEvents() {
+        try {
+          if (!window.electronAPI || typeof window.electronAPI.listSftpEvents !== 'function') {
+            setEventOptions([], 'Eventi non disponibili');
+            return;
+          }
+          window.electronAPI.listSftpEvents().then(function (result) {
+            if (result && result.success && Array.isArray(result.events) && result.events.length) {
+              setEventOptions(result.events, '-- Seleziona un evento --');
+            } else {
+              setEventOptions([], (result && result.message) || 'Nessun evento trovato');
+            }
+          }).catch(function () {
+            setEventOptions([], 'Errore caricamento eventi');
+          });
+        } catch (_) {
+          setEventOptions([], 'Errore caricamento eventi');
+        }
+      }
+
+      loadSftpEvents();
 
       // ─── Capture: snapshot di ms-cam-video + cornice ───────────────────────
       function showFotoTemp(url) {

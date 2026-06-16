@@ -40,7 +40,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('window-fullscreen-changed', handler);
   },
   getSaveFolder: () => ipcRenderer.invoke('get-save-folder'),
+  listSftpEvents: () => ipcRenderer.invoke('list-sftp-events'),
   setCurrentEventFolder: (eventName) => ipcRenderer.invoke('set-current-event-folder', eventName),
+  setCurrentEventContext: (payload) => ipcRenderer.invoke('set-current-event-context', payload || {}),
   getEventPhotos: (eventName) => ipcRenderer.invoke('get-event-photos', eventName),
   resolveOriginalPhotoPath: (eventName, photoId) => ipcRenderer.invoke('resolve-original-photo-path', eventName, photoId),
   saveCapturedPhoto: (payload) => ipcRenderer.invoke('save-captured-photo', payload),

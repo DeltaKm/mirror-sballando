@@ -3,6 +3,34 @@ const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const Client = require('ssh2-sftp-client');
+const { Client: SshClient } = require('ssh2');
+
+function loadLocalEnvFile() {
+  const candidates = [
+    path.join(__dirname, '.env'),
+    path.join(path.dirname(process.execPath), '.env')
+  ];
+
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const raw = fsSync.readFileSync(candidates[i], 'utf8');
+      raw.split(/\r?\n/).forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return;
+        const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+        if (!match || process.env[match[1]] !== undefined) return;
+        let value = match[2].trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        process.env[match[1]] = value;
+      });
+      return;
+    } catch (_) {}
+  }
+}
+
+loadLocalEnvFile();
 
 const BROKER_URL = process.env.PRINT_BROKER_URL || 'http://127.0.0.1:5177';
 const BROKER_TOKEN_HEADER = process.env.PRINT_BROKER_TOKEN_HEADER || 'X-Local-Token';
@@ -12,6 +40,9 @@ let mainWindow;
 let isApplyingBounds = false;
 let msSessionModeActive = false;
 let currentEventFolderName = '';
+let currentEventRemoteContext = null;
+let isPhotoSyncRunning = false;
+let photoSyncTimer = null;
 function _setSessionFlag(val, ctx) {
   const prev = msSessionModeActive;
   msSessionModeActive = !!val;
@@ -227,6 +258,47 @@ function getCurrentEventFolderName() {
   return 'evento_senza_nome';
 }
 
+function normalizeEventRemoteContext(payload = {}) {
+  const id = String(payload.id || '').trim();
+  const token = String(payload.token || '').trim();
+  const title = String(payload.title || payload.name || '').trim();
+  const folder = title ? getSafeEventFolderName(title) : getCurrentEventFolderName();
+  if (!id && !token && !title) return null;
+  return { id, token, title, folder };
+}
+
+function setCurrentEventContext(payload = {}) {
+  const context = normalizeEventRemoteContext(payload);
+  if (!context) {
+    currentEventRemoteContext = null;
+    saveSettings({ lastEventRemoteContext: null });
+    return null;
+  }
+
+  currentEventRemoteContext = context;
+  if (context.title) setCurrentEventFolderName(context.title);
+  saveSettings({ lastEventRemoteContext: context });
+  schedulePhotoSyncSoon();
+  return context;
+}
+
+function getCurrentEventContext() {
+  if (currentEventRemoteContext && (currentEventRemoteContext.token || currentEventRemoteContext.id || currentEventRemoteContext.title)) {
+    return currentEventRemoteContext;
+  }
+  const s = loadSettings();
+  const saved = normalizeEventRemoteContext(s.lastEventRemoteContext || {});
+  if (saved) {
+    currentEventRemoteContext = saved;
+    return saved;
+  }
+  const folder = getCurrentEventFolderName();
+  if (folder && folder !== 'evento_senza_nome') {
+    return { id: '', token: '', title: folder, folder };
+  }
+  return null;
+}
+
 function loadSettings() {
   if (_settings) return _settings;
   try {
@@ -259,6 +331,339 @@ function getPhotoRootPath() {
     return normalizePhotoRootPath(s.photoSavePath.trim());
   }
   return getDefaultPhotoRootPath();
+}
+
+async function buildSftpConnectionConfig(options = {}) {
+  const host = process.env.SFTP_HOST;
+  const username = process.env.SFTP_USERNAME;
+  const password = process.env.SFTP_PASSWORD;
+  const privateKeyPath = process.env.SFTP_PRIVATE_KEY_PATH;
+  const port = Number(process.env.SFTP_PORT || '22');
+  const requireRemoteBasePath = !!options.requireRemoteBasePath;
+  const remoteBasePath = process.env.SFTP_REMOTE_BASE_PATH;
+
+  if (!host || !username || (!password && !privateKeyPath) || (requireRemoteBasePath && !remoteBasePath)) {
+    return {
+      success: false,
+      message: requireRemoteBasePath
+        ? 'Config SFTP mancante. Imposta SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD o SFTP_PRIVATE_KEY_PATH, SFTP_REMOTE_BASE_PATH.'
+        : 'Config SFTP mancante. Imposta SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD o SFTP_PRIVATE_KEY_PATH.'
+    };
+  }
+
+  const config = { host, port: Number.isFinite(port) && port > 0 ? port : 22, username };
+  if (password) config.password = password;
+  if (privateKeyPath) config.privateKey = await fs.readFile(privateKeyPath);
+  return { success: true, config, remoteBasePath };
+}
+
+function getSftpEventsRemotePath() {
+  const configured = String(process.env.SFTP_EVENTS_REMOTE_PATH || process.env.SFTP_REMOTE_BASE_PATH || '/').trim();
+  return configured || '/';
+}
+
+function getSftpGalleryRemoteBasePath() {
+  const configured = String(process.env.SFTP_GALLERY_REMOTE_BASE_PATH || '').trim();
+  if (configured) return configured;
+  const eventsPath = getSftpEventsRemotePath();
+  return path.posix.join(path.posix.dirname(eventsPath), 'images', 'events');
+}
+
+function isRemoteEventEntry(entry) {
+  const name = String(entry && entry.name || '').trim();
+  if (!name || name === '.' || name === '..' || name.startsWith('.')) return false;
+  if (entry && entry.type && entry.type !== 'd') return false;
+  return !/^(gallery|tmp|temp|cache|logs?)$/i.test(name);
+}
+
+function executeSshCommand(config, command, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const ssh = new SshClient();
+    let stdout = '';
+    let stderr = '';
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      try { ssh.end(); } catch (_) {}
+      reject(new Error('Timeout SSH durante lettura eventi'));
+    }, timeoutMs);
+
+    const done = (error, result) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try { ssh.end(); } catch (_) {}
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    ssh.on('ready', () => {
+      ssh.exec(command, (error, stream) => {
+        if (error) {
+          done(error);
+          return;
+        }
+        stream.on('close', (code) => {
+          if (code && code !== 0) {
+            done(new Error((stderr || stdout || `Comando SSH fallito (${code})`).trim()));
+            return;
+          }
+          done(null, { stdout, stderr });
+        }).on('data', (data) => {
+          stdout += data.toString();
+        });
+        stream.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+      });
+    }).on('error', done).connect(config);
+  });
+}
+
+async function listRemoteLaravelEvents() {
+  const sftpConfig = await buildSftpConnectionConfig();
+  if (!sftpConfig.success) return sftpConfig;
+
+  const phpScript = `cd /var/www/html/webservice.sballando.it && php <<'PHP'
+<?php
+require __DIR__ . '/vendor/autoload.php';
+$app = require __DIR__ . '/bootstrap/app.php';
+$app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap();
+$events = App\\Models\\Event::select('id','token','title','subtitle','datetime_start','datetime_end','state','is_public')
+    ->where('state', 'published')
+    ->orderBy('datetime_start', 'desc')
+    ->get();
+foreach ($events as $event) {
+    echo json_encode([
+        'id' => $event->id,
+        'token' => $event->token,
+        'title' => $event->title,
+        'subtitle' => $event->subtitle,
+        'datetime_start' => (string) $event->datetime_start,
+        'datetime_end' => (string) $event->datetime_end,
+        'state' => $event->state,
+        'is_public' => $event->is_public,
+    ], JSON_UNESCAPED_UNICODE) . PHP_EOL;
+}
+PHP`;
+
+  const result = await executeSshCommand(sftpConfig.config, phpScript);
+  const events = String(result.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try { return JSON.parse(line); } catch (_) { return null; }
+    })
+    .filter(Boolean)
+    .map((event) => {
+      const title = String(event.title || '').trim();
+      const date = String(event.datetime_start || '').trim();
+      return {
+        id: String(event.id || event.token || title),
+        token: event.token || '',
+        name: title,
+        title: date ? `${title} (${date})` : title,
+        rawTitle: title,
+        subtitle: event.subtitle || '',
+        datetimeStart: event.datetime_start || null,
+        datetimeEnd: event.datetime_end || null
+      };
+    })
+    .filter((event) => event.title);
+
+  return { success: true, events, source: 'laravel-events' };
+}
+
+async function listSftpEvents() {
+  try {
+    const remoteEvents = await listRemoteLaravelEvents();
+    if (remoteEvents.success && remoteEvents.events && remoteEvents.events.length) {
+      return remoteEvents;
+    }
+  } catch (error) {
+    console.warn('[sftp-events] Laravel events unavailable:', error && error.message ? error.message : error);
+  }
+
+  const sftpConfig = await buildSftpConnectionConfig();
+  if (!sftpConfig.success) return sftpConfig;
+
+  const sftp = new Client();
+  try {
+    const remotePath = getSftpEventsRemotePath();
+    await sftp.connect(sftpConfig.config);
+    const entries = await sftp.list(remotePath);
+    const events = entries
+      .filter(isRemoteEventEntry)
+      .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'it', { sensitivity: 'base' }))
+      .map((entry) => {
+        const name = String(entry.name || '').trim();
+        return {
+          id: name,
+          name,
+          title: name,
+          path: path.posix.join(remotePath, name),
+          modifiedAt: entry.modifyTime || null
+        };
+      });
+
+    return { success: true, events, remotePath };
+  } catch (error) {
+    return { success: false, message: `Errore lettura eventi SFTP: ${error.message}` };
+  } finally {
+    try { await sftp.end(); } catch (_) {}
+  }
+}
+
+function getRemoteGalleryFolderForContext(context) {
+  const token = String(context && context.token || '').trim();
+  if (!token) return '';
+  return path.posix.join(getSftpGalleryRemoteBasePath(), token, 'gallery');
+}
+
+async function getLocalEventFoldersForContext(context) {
+  const rootPath = getPhotoRootPath();
+  const candidates = [];
+  const push = (folderName) => {
+    const safe = getSafeEventFolderName(folderName || '');
+    if (!safe || safe === 'evento_senza_nome' || candidates.indexOf(safe) >= 0) return;
+    candidates.push(safe);
+  };
+
+  push(context && context.folder);
+  push(context && context.title);
+  push(getCurrentEventFolderName());
+
+  const baseTitle = String(context && context.title || '')
+    .replace(/\s*\([^)]*\)\s*$/g, '')
+    .trim();
+  const safeBase = getSafeEventFolderName(baseTitle || '');
+  if (safeBase && safeBase !== 'evento_senza_nome') {
+    push(safeBase);
+    try {
+      const names = await fs.readdir(rootPath);
+      names.forEach((name) => {
+        if (String(name || '').toLowerCase().startsWith(safeBase.toLowerCase())) push(name);
+      });
+    } catch (_) {}
+  }
+
+  return candidates;
+}
+
+async function uploadPhotoToSelectedEventGallery(localPath, context = getCurrentEventContext()) {
+  const eventContext = normalizeEventRemoteContext(context || {});
+  if (!eventContext || !eventContext.token) {
+    return { success: false, skipped: true, message: 'Evento remoto non selezionato o token mancante' };
+  }
+
+  const fileName = path.basename(String(localPath || '').trim());
+  if (!fileName || !/\.(jpg|jpeg|png|webp)$/i.test(fileName)) {
+    return { success: false, skipped: true, message: 'File foto non valido' };
+  }
+
+  await fs.access(localPath);
+  const sftpConfig = await buildSftpConnectionConfig();
+  if (!sftpConfig.success) return sftpConfig;
+
+  const remoteDir = getRemoteGalleryFolderForContext(eventContext);
+  const remotePath = path.posix.join(remoteDir, fileName);
+  const sftp = new Client();
+  try {
+    await sftp.connect(sftpConfig.config);
+    try {
+      await sftp.stat(remotePath);
+      return { success: true, skipped: true, remotePath, message: 'Foto gia presente sul server' };
+    } catch (_) {}
+    await sftp.mkdir(remoteDir, true);
+    await sftp.put(localPath, remotePath);
+    return { success: true, remotePath };
+  } finally {
+    try { await sftp.end(); } catch (_) {}
+  }
+}
+
+async function syncCurrentEventPhotosToServer() {
+  if (isPhotoSyncRunning) return { success: false, skipped: true, message: 'Sync foto gia in corso' };
+
+  const context = getCurrentEventContext();
+  if (!context || !context.token) {
+    return { success: false, skipped: true, message: 'Nessun evento remoto selezionato' };
+  }
+
+  const folders = await getLocalEventFoldersForContext(context);
+  if (!folders.length) {
+    return { success: false, skipped: true, message: 'Cartella evento non disponibile' };
+  }
+
+  isPhotoSyncRunning = true;
+  try {
+    const photos = [];
+    const seen = new Set();
+    for (const folder of folders) {
+      const folderPath = path.join(getPhotoRootPath(), folder);
+      let names = [];
+      try {
+        names = await fs.readdir(folderPath);
+      } catch (_) {
+        names = [];
+      }
+      names
+        .filter((name) => /\.(jpg|jpeg|png|webp)$/i.test(name))
+        .forEach((name) => {
+          const photoPath = path.join(folderPath, name);
+          if (seen.has(photoPath)) return;
+          seen.add(photoPath);
+          photos.push(photoPath);
+        });
+    }
+
+    let uploaded = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (const photoPath of photos) {
+      try {
+        const result = await uploadPhotoToSelectedEventGallery(photoPath, context);
+        if (result && result.success && result.skipped) skipped++;
+        else if (result && result.success) uploaded++;
+        else skipped++;
+      } catch (error) {
+        failed++;
+        console.warn('[photo-sync] upload failed:', photoPath, error && error.message ? error.message : error);
+      }
+    }
+    return { success: failed === 0, uploaded, skipped, failed, total: photos.length };
+  } finally {
+    isPhotoSyncRunning = false;
+  }
+}
+
+function schedulePhotoSyncSoon(delayMs = 1500) {
+  setTimeout(() => {
+    syncCurrentEventPhotosToServer().catch((error) => {
+      console.warn('[photo-sync] scheduled sync failed:', error && error.message ? error.message : error);
+    });
+  }, delayMs);
+}
+
+function uploadPhotoImmediatelyAfterSave(localPath, context = getCurrentEventContext()) {
+  setTimeout(() => {
+    uploadPhotoToSelectedEventGallery(localPath, context).catch((error) => {
+      console.warn('[photo-sync] immediate upload failed:', localPath, error && error.message ? error.message : error);
+      schedulePhotoSyncSoon(10 * 1000);
+    });
+  }, 0);
+}
+
+function startPhotoSyncLoop() {
+  if (photoSyncTimer) return;
+  photoSyncTimer = setInterval(() => {
+    syncCurrentEventPhotosToServer().catch((error) => {
+      console.warn('[photo-sync] periodic sync failed:', error && error.message ? error.message : error);
+    });
+  }, 60 * 1000);
+  schedulePhotoSyncSoon(5000);
 }
 
 function getBrokerDataDirectory() {
@@ -5328,6 +5733,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
       .ms-tog input:checked + .ms-slider::before { transform: translateX(20px); }
       .ms-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
       .ms-field:last-child { margin-bottom: 0; }
+      .ms-inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+      .ms-inline-fields .ms-field { margin-bottom: 0 !important; }
       .ms-fl { font-size: 10px; font-weight: 600; color: rgba(255,255,255,0.35); text-transform: uppercase; letter-spacing: 0.07em; }
       #ms-frames-grid { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; align-items: flex-start; }
       .ms-fi { position: relative; width: 48px; height: 72px; border-radius: 8px; overflow: hidden; border: 2px solid rgba(255,255,255,0.1); cursor: pointer; flex-shrink: 0; transition: border-color 0.2s, transform 0.2s; }
@@ -5339,8 +5746,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
       #ms-add-frame-lbl:hover { border-color: rgba(255,255,255,0.45); color: rgba(255,255,255,0.7); }
       .ms-path-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
       .ms-path-display { flex: 1; min-width: 0; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: rgba(255,255,255,0.75); font-size: 12px; padding: 8px 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; }
-      #ms-btn-choose-folder { background: rgba(230,57,70,0.18); border: 1px solid rgba(230,57,70,0.4); border-radius: 10px; color: #E63946; font-size: 12px; font-weight: 600; padding: 8px 14px; cursor: pointer; white-space: nowrap; transition: background 0.2s, border-color 0.2s; font-family: inherit; flex-shrink: 0; }
-      #ms-btn-choose-folder:hover { background: rgba(230,57,70,0.3); border-color: rgba(230,57,70,0.7); }
+      #ms-btn-choose-folder, #ms-btn-sync-events { background: rgba(230,57,70,0.18); border: 1px solid rgba(230,57,70,0.4); border-radius: 10px; color: #E63946; font-size: 12px; font-weight: 600; padding: 8px 14px; cursor: pointer; white-space: nowrap; transition: background 0.2s, border-color 0.2s; font-family: inherit; flex-shrink: 0; }
+      #ms-btn-choose-folder:hover, #ms-btn-sync-events:hover { background: rgba(230,57,70,0.3); border-color: rgba(230,57,70,0.7); }
+      #ms-btn-sync-events { width: 100%; margin-top: 4px; color: #fff; }
+      #ms-btn-sync-events.is-syncing { opacity: 0.72; cursor: wait; }
       #ms-session-blocker { position: fixed; inset: 0; z-index: 99990; background: transparent; display: none; cursor: default; pointer-events: none; }
       #ms-nav-mask { position: fixed; inset: 0; z-index: 2147483001; background: #000; display: none; opacity: 0; pointer-events: none; }
       html[data-ms-session="1"] #ms-session-blocker { display: none !important; pointer-events: none !important; }
@@ -5764,10 +6173,10 @@ function injectRemoteUiRedesign(win, targetFrame) {
       #ms-c-frames.ms-frames-strip .ms-fi.sel::after {
         opacity: 0 !important;
       }
-      /* Badge check tondo in alto a destra */
+      /* Badge check tondo in alto a sinistra, lontano dal pulsante elimina */
       #ms-c-frames.ms-frames-strip .ms-fi.sel::before {
         content: '';
-        position: absolute; top: 8px; right: 8px; z-index: 3;
+        position: absolute; top: 8px; left: 8px; z-index: 3;
         width: 26px; height: 26px;
         border-radius: 999px;
         pointer-events: none;
@@ -5780,6 +6189,19 @@ function injectRemoteUiRedesign(win, targetFrame) {
           linear-gradient(135deg, #ff6b7e 0%, #e63946 60%, #b8203a 100%);
         background-repeat: no-repeat, no-repeat;
         background-position: center, center;
+      }
+      #ms-c-frames.ms-frames-strip .ms-fi-del {
+        top: 8px !important; right: 8px !important;
+        width: 26px !important; height: 26px !important;
+        border-radius: 999px !important;
+        font-size: 17px !important;
+        line-height: 1 !important;
+        background: linear-gradient(135deg, #ff6b7e 0%, #e63946 60%, #b8203a 100%) !important;
+        box-shadow:
+          0 4px 14px rgba(230,57,70,0.55),
+          0 0 0 2px rgba(0,0,0,0.50),
+          inset 0 1px 0 rgba(255,255,255,0.30) !important;
+        z-index: 3 !important;
       }
 
       /* Tile "+ Aggiungi" come prima opzione speciale (se presente) */
@@ -6278,6 +6700,13 @@ function injectRemoteUiRedesign(win, targetFrame) {
       }
       .ms-field { gap: 5px !important; margin-bottom: 9px !important; }
       .ms-field:last-child { margin-bottom: 0 !important; }
+      .ms-inline-fields {
+        display: grid !important;
+        grid-template-columns: 1fr 1fr !important;
+        gap: 8px !important;
+        margin-bottom: 9px !important;
+      }
+      .ms-inline-fields .ms-field { margin-bottom: 0 !important; min-width: 0; }
 
       /* Toggle premium */
       .ms-tog { width: 44px !important; height: 24px !important; }
@@ -6302,7 +6731,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
         font-size: 12.5px !important; padding: 10px 14px !important; border-radius: 12px !important;
         color: rgba(255,255,255,0.78) !important;
       }
-      #ms-btn-choose-folder {
+      #ms-btn-choose-folder, #ms-btn-sync-events {
         background: linear-gradient(180deg, rgba(230,57,70,0.20), rgba(230,57,70,0.10)) !important;
         border: 1px solid rgba(230,57,70,0.45) !important;
         color: #ff8b95 !important;
@@ -6310,11 +6739,20 @@ function injectRemoteUiRedesign(win, targetFrame) {
         border-radius: 12px !important;
         transition: transform 0.18s, background 0.18s, border-color 0.18s, box-shadow 0.18s !important;
       }
-      #ms-btn-choose-folder:hover {
+      #ms-btn-choose-folder:hover, #ms-btn-sync-events:hover {
         background: linear-gradient(180deg, rgba(230,57,70,0.34), rgba(230,57,70,0.18)) !important;
         border-color: rgba(230,57,70,0.75) !important;
         transform: translateY(-1px);
         box-shadow: 0 8px 20px rgba(230,57,70,0.30);
+      }
+      #ms-btn-sync-events {
+        width: 100% !important;
+        margin-top: 3px !important;
+        color: #fff !important;
+      }
+      #ms-btn-sync-events.is-syncing {
+        opacity: 0.72 !important;
+        cursor: wait !important;
       }
 
       /* Calibrazione: grid migliorato + canvas centrale */
@@ -6443,7 +6881,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
           '<div class="ms-status">' +
             '<div class="ms-si" id="ms-si-cam"><span class="ms-dot" id="ms-d-cam"></span><span>Camera</span></div>' +
             '<div class="ms-si" id="ms-si-prt"><span class="ms-dot" id="ms-d-prt"></span><span id="ms-prt-label">Stampante</span><div class="ms-prt-progress" id="ms-prt-progress"><div class="ms-prt-progress-bar" id="ms-prt-progress-bar"></div></div></div>' +
-            '<div class="ms-si" id="ms-si-evt"><span class="ms-dot" id="ms-d-evt"></span><span>Evento</span></div>' +
+            '<div class="ms-si" id="ms-si-evt"><span class="ms-dot offline" id="ms-d-evt"></span><span id="ms-evt-label">Disconnesso</span></div>' +
             '<div class="ms-tb-sep"></div>' +
             '<button id="ms-settings-btn" type="button" class="ms-tb-cta" aria-label="Impostazioni" title="Impostazioni">' +
               '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -6548,7 +6986,14 @@ function injectRemoteUiRedesign(win, targetFrame) {
           '<div class="ms-card" id="ms-c-timing">' +
             '<div class="ms-ct">Tempi</div>' +
             '<div class="ms-field"><span class="ms-fl">Scatto (secondi)</span><select class="ms-sel" id="ms-s-countdown"></select></div>' +
-            '<div class="ms-field"><span class="ms-fl">Inattivit\u00e0 (minuti)</span><select class="ms-sel" id="ms-s-inactivity"></select></div>' +
+            '<div class="ms-inline-fields">' +
+              '<div class="ms-field"><span class="ms-fl">Inattivit\u00e0 min</span><select class="ms-sel" id="ms-s-inactivity"></select></div>' +
+              '<div class="ms-field"><span class="ms-fl">Inattivit\u00e0 sec</span><select class="ms-sel" id="ms-s-inactivity-sec"></select></div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="ms-card" id="ms-c-event-sync">' +
+            '<div class="ms-ct">Sync eventi</div>' +
+            '<button id="ms-btn-sync-events" type="button">Sync eventi</button>' +
           '</div>' +
           '<div class="ms-card ms-card-full" id="ms-c-calibration">' +
             '<div class="ms-cal-head">' +
@@ -6966,11 +7411,151 @@ function injectRemoteUiRedesign(win, targetFrame) {
     // â”€â”€ EVENT SELECT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     var MS_LAST_EVT_KEY = 'ms-last-event-text';
 
+    var ensureOrigEventSelect = function() {
+      var orig = findOrigEventSelect();
+      if (orig) return orig;
+      try {
+        orig = document.createElement('select');
+        orig.name = 'event_selected';
+        orig.id = 'event_selected';
+        orig.style.cssText = 'position:absolute;left:-99999px;width:1px;height:1px;overflow:hidden;';
+        var first = document.createElement('option');
+        first.value = '';
+        first.textContent = 'Caricamento eventi...';
+        first.selected = true;
+        orig.appendChild(first);
+        (document.body || document.documentElement).appendChild(orig);
+        return orig;
+      } catch (_) {
+        return null;
+      }
+    };
+
+    var applyRemoteEventsToOrigSelect = function(events) {
+      var orig = ensureOrigEventSelect();
+      if (!orig || !Array.isArray(events)) return false;
+
+      var prevValue = String(orig.value || '').trim();
+      var savedTxt = '';
+      try { savedTxt = String(localStorage.getItem(MS_LAST_EVT_KEY) || '').trim(); } catch (_) {}
+
+      orig.innerHTML = '';
+      var first = document.createElement('option');
+      first.value = '';
+      first.textContent = '-- Seleziona un evento --';
+      orig.appendChild(first);
+
+      events.forEach(function(eventItem) {
+        if (!eventItem) return;
+        var title = String(eventItem.title || eventItem.name || eventItem.rawTitle || eventItem.id || '').trim();
+        if (!title) return;
+        var option = document.createElement('option');
+        option.value = String(eventItem.id || eventItem.token || eventItem.name || title);
+        option.text = title;
+        option.dataset.token = String(eventItem.token || '');
+        option.dataset.rawTitle = String(eventItem.rawTitle || eventItem.name || title);
+        orig.appendChild(option);
+      });
+
+      var restored = false;
+      for (var i = 0; i < orig.options.length; i++) {
+        var opt = orig.options[i];
+        var txt = String(opt.text || opt.textContent || '').trim();
+        if ((prevValue && opt.value === prevValue) || (savedTxt && txt === savedTxt)) {
+          orig.selectedIndex = i;
+          restored = true;
+          break;
+        }
+      }
+      if (!restored) orig.selectedIndex = 0;
+
+      try { orig.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+      syncEvtSel();
+      return true;
+    };
+
+    var refreshRemoteEvents = function(manual) {
+      var btn = document.getElementById('ms-btn-sync-events');
+      var setEventServerStatus = function(connected) {
+        try {
+          var dot = document.getElementById('ms-d-evt');
+          var si = document.getElementById('ms-si-evt');
+          var label = document.getElementById('ms-evt-label');
+          if (dot) dot.className = 'ms-dot ' + (connected ? 'online' : 'offline');
+          if (si) si.classList.toggle('active', !!connected);
+          if (label) label.textContent = connected ? 'Connesso' : 'Disconnesso';
+        } catch (_) {}
+      };
+
+      if (!window.electronAPI || typeof window.electronAPI.listSftpEvents !== 'function') {
+        setEventServerStatus(false);
+        if (manual) showToast('Sync eventi non disponibile', 2200);
+        return Promise.resolve(false);
+      }
+
+      if (btn) {
+        btn.classList.add('is-syncing');
+        btn.disabled = true;
+        btn.textContent = 'Sync in corso...';
+      }
+
+      return window.electronAPI.listSftpEvents().then(function(result) {
+        var count = result && Array.isArray(result.events) ? result.events.length : 0;
+        if (result && result.success) {
+          setEventServerStatus(true);
+          if (count > 0) applyRemoteEventsToOrigSelect(result.events);
+          if (manual) showToast('Eventi sincronizzati: ' + count, 2200, '#22c55e');
+          return true;
+        }
+        setEventServerStatus(false);
+        if (manual) showToast((result && result.message) || 'Nessun evento trovato in rete', 2600);
+        return false;
+      }).catch(function(error) {
+        setEventServerStatus(false);
+        if (manual) showToast('Errore sync eventi: ' + ((error && error.message) || 'sconosciuto'), 3200);
+        return false;
+      }).then(function(ok) {
+        if (btn) {
+          btn.classList.remove('is-syncing');
+          btn.disabled = false;
+          btn.textContent = 'Sync eventi';
+        }
+        return ok;
+      });
+    };
+
+    var wireEventSync = function() {
+      var btn = document.getElementById('ms-btn-sync-events');
+      if (btn && !btn.dataset.msb) {
+        btn.dataset.msb = '1';
+        btn.addEventListener('click', function() { refreshRemoteEvents(true); });
+      }
+
+      if (!window.__msEventSyncTimer) {
+        setTimeout(function() { refreshRemoteEvents(false); }, 700);
+        window.__msEventSyncTimer = setInterval(function() {
+          refreshRemoteEvents(false);
+        }, 5 * 60 * 1000);
+      }
+    };
+
     var syncEvtSel = function() {
       var ui = document.getElementById('ms-evt-sel');
       var search = document.getElementById('ms-evt-search');
       var orig = findOrigEventSelect();
       if (!ui || !orig) return;
+
+      var syncCurrentEventContext = function(selTxt) {
+        try {
+          if (!window.electronAPI || typeof window.electronAPI.setCurrentEventContext !== 'function') return;
+          var opt = ui && ui.selectedIndex >= 0 && ui.options ? ui.options[ui.selectedIndex] : null;
+          window.electronAPI.setCurrentEventContext({
+            id: opt ? String(opt.value || '') : '',
+            token: opt && opt.dataset ? String(opt.dataset.token || '') : '',
+            title: selTxt || (opt ? String(opt.text || opt.textContent || '') : '')
+          }).catch(function() {});
+        } catch (_) {}
+      };
 
       var syncCurrentEventFolder = function(txt) {
         try {
@@ -7001,6 +7586,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
           var o = document.createElement('option');
           o.value = it.value;
           o.text = it.text;
+          if (it.token) o.dataset.token = it.token;
+          if (it.rawTitle) o.dataset.rawTitle = it.rawTitle;
           if (it.selected) o.selected = true;
           ui.appendChild(o);
         });
@@ -7024,7 +7611,13 @@ function injectRemoteUiRedesign(win, targetFrame) {
         } else if (!savedEvtTxt && opt.selected) {
           selected = true;
         }
-        ui.__msAllOptions.push({ value: opt.value, text: optDisplay, selected: selected });
+        ui.__msAllOptions.push({
+          value: opt.value,
+          text: optDisplay,
+          token: opt.dataset ? String(opt.dataset.token || '') : '',
+          rawTitle: opt.dataset ? String(opt.dataset.rawTitle || '') : '',
+          selected: selected
+        });
       });
       applyEvtFilter();
 
@@ -7044,10 +7637,6 @@ function injectRemoteUiRedesign(win, targetFrame) {
         } catch (_) {}
       }
 
-      if (ui.value) {
-        var d = document.getElementById('ms-d-evt'); if (d) d.className = 'ms-dot online';
-        var si = document.getElementById('ms-si-evt'); if (si) si.classList.add('active');
-      }
       if (!ui.dataset.msb) {
         ui.dataset.msb = '1';
         ui.addEventListener('change', function() {
@@ -7059,10 +7648,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
           try { localStorage.setItem(MS_LAST_EVT_KEY, selTxt); } catch (_) {}
           if (orig) { orig.value = ui.value; orig.dispatchEvent(new Event('change', { bubbles: true })); }
           syncCurrentEventFolder(selTxt);
+          syncCurrentEventContext(selTxt);
           __msRefreshPreviewIdWatermark();
-          var hasEvt = !!ui.value;
-          var dot = document.getElementById('ms-d-evt'); if (dot) dot.className = 'ms-dot' + (hasEvt ? ' online' : '');
-          var si2 = document.getElementById('ms-si-evt'); if (si2) si2.classList.toggle('active', hasEvt);
         });
       }
 
@@ -7077,6 +7664,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
       }
 
       syncCurrentEventFolder(effectiveTxt);
+      syncCurrentEventContext(effectiveTxt);
       __msRefreshPreviewIdWatermark();
     };
 
@@ -7149,10 +7737,62 @@ function injectRemoteUiRedesign(win, targetFrame) {
     };
 
     // â”€â”€ TIMING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    var syncInactivityTotal = function(origEl) {
+      try {
+        var minUi = document.getElementById('ms-s-inactivity');
+        var secUi = document.getElementById('ms-s-inactivity-sec');
+        var min = parseInt((minUi && minUi.value) || localStorage.getItem('msInactivityMin') || '2', 10);
+        var sec = parseInt((secUi && secUi.value) || localStorage.getItem('msInactivitySec') || '0', 10);
+        if (!isFinite(min) || min < 0) min = 0;
+        if (!isFinite(sec) || sec < 0) sec = 0;
+        if (sec > 59) sec = 59;
+        var totalSec = Math.max(1, (min * 60) + sec);
+        localStorage.setItem('msInactivityMin', String(min));
+        localStorage.setItem('msInactivitySec', String(sec));
+        localStorage.setItem('msInactivityTotalSec', String(totalSec));
+
+        var legacy = origEl || findOrigTimingEl('inattiv');
+        if (legacy) {
+          var legacyMin = String(Math.max(1, Math.ceil(totalSec / 60)));
+          legacy.value = legacyMin;
+          legacy.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } catch (_) {}
+    };
+
+    var bindInactivitySeconds = function() {
+      var ui = document.getElementById('ms-s-inactivity-sec');
+      if (!ui) return;
+      var saved = '0';
+      try { saved = String(localStorage.getItem('msInactivitySec') || '0'); } catch (_) {}
+      ui.innerHTML = '';
+      for (var sec = 0; sec < 60; sec += 5) {
+        var o = document.createElement('option');
+        o.value = String(sec);
+        o.textContent = String(sec);
+        if (String(sec) === saved) o.selected = true;
+        ui.appendChild(o);
+      }
+      if (!ui.value && ui.options.length) ui.selectedIndex = 0;
+      if (!ui.dataset.msb) {
+        ui.dataset.msb = '1';
+        ui.addEventListener('change', function() {
+          try { localStorage.setItem('msInactivitySec', String(parseInt(ui.value, 10) || 0)); } catch (_) {}
+          syncInactivityTotal();
+        });
+      }
+      syncInactivityTotal();
+    };
+
     var bindTiming = function(selectId, origEl) {
       var ui = document.getElementById(selectId);
       if (!ui || !origEl) return;
       if (origEl.tagName === 'SELECT' && origEl.options.length === 0) return;
+      ui.__msOrigTimingEl = origEl;
+      var storageKey = selectId === 'ms-s-countdown' ? 'msCountdownSec' : 'msInactivityMin';
+      var fallbackValue = selectId === 'ms-s-countdown' ? '3' : '2';
+      var savedValue = '';
+      try { savedValue = String(localStorage.getItem(storageKey) || '').trim(); } catch (_) {}
       ui.innerHTML = '';
       if (origEl.tagName === 'SELECT') {
         Array.from(origEl.options).forEach(function(opt) {
@@ -7166,21 +7806,32 @@ function injectRemoteUiRedesign(win, targetFrame) {
           if (v === cur) o.selected = true; ui.appendChild(o);
         }
       }
+      if (savedValue) {
+        for (var si = 0; si < ui.options.length; si++) {
+          if (String(ui.options[si].value) === savedValue) { ui.selectedIndex = si; break; }
+        }
+      }
+      if (!ui.value && ui.options.length) {
+        for (var fi = 0; fi < ui.options.length; fi++) {
+          if (String(ui.options[fi].value) === fallbackValue) { ui.selectedIndex = fi; break; }
+        }
+      }
+      try {
+        if (origEl.tagName === 'SELECT') { origEl.value = ui.value; origEl.dispatchEvent(new Event('change', { bubbles: true })); }
+        else { origEl.value = ui.value; origEl.dispatchEvent(new Event('input', { bubbles: true })); origEl.dispatchEvent(new Event('change', { bubbles: true })); }
+      } catch (_) {}
       if (!ui.dataset.msb) {
         ui.dataset.msb = '1';
         ui.addEventListener('change', function() {
-          if (origEl.tagName === 'SELECT') { origEl.value = ui.value; origEl.dispatchEvent(new Event('change', { bubbles: true })); }
-          else { origEl.value = ui.value; origEl.dispatchEvent(new Event('input', { bubbles: true })); origEl.dispatchEvent(new Event('change', { bubbles: true })); }
-          // Salva il countdown in localStorage così la pagina sessione lo legge
-          if (selectId === 'ms-s-countdown') {
-            try { localStorage.setItem('msCountdownSec', String(parseInt(ui.value, 10) || 3)); } catch (_) {}
-          }
+          var target = ui.__msOrigTimingEl || origEl;
+          if (target.tagName === 'SELECT') { target.value = ui.value; target.dispatchEvent(new Event('change', { bubbles: true })); }
+          else { target.value = ui.value; target.dispatchEvent(new Event('input', { bubbles: true })); target.dispatchEvent(new Event('change', { bubbles: true })); }
+          try { localStorage.setItem(storageKey, String(parseInt(ui.value, 10) || parseInt(fallbackValue, 10))); } catch (_) {}
+          if (selectId === 'ms-s-inactivity') syncInactivityTotal(target);
         });
-        // Salva subito il valore corrente al binding
-        if (selectId === 'ms-s-countdown') {
-          try { localStorage.setItem('msCountdownSec', String(parseInt(ui.value, 10) || 3)); } catch (_) {}
-        }
       }
+      try { localStorage.setItem(storageKey, String(parseInt(ui.value, 10) || parseInt(fallbackValue, 10))); } catch (_) {}
+      if (selectId === 'ms-s-inactivity') syncInactivityTotal(origEl);
     };
 
     // â”€â”€ BUTTONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -9203,6 +9854,8 @@ function injectRemoteUiRedesign(win, targetFrame) {
       bindToggle('ms-t-print', findOrigCheckbox('stamp'));
       bindTiming('ms-s-countdown', findOrigTimingEl('scatt'));
       bindTiming('ms-s-inactivity', findOrigTimingEl('inattiv'));
+      bindInactivitySeconds();
+      wireEventSync();
       __msPopulatePrinterDropdown();
       __msWirePrintCalibration();
       __msSubscribePrinterState();
@@ -10140,6 +10793,7 @@ function injectRemoteUiRedesign(win, targetFrame) {
       // Inattività
       var iaUi = document.getElementById('ms-s-inactivity');
       if (!iaUi || iaUi.options.length === 0) bindTiming('ms-s-inactivity', findOrigTimingEl('inattiv'));
+      bindInactivitySeconds();
       // Toggles
       var sndEl = document.getElementById('ms-t-sound');
       bindToggle('ms-t-sound', findOrigCheckbox('suon'));
@@ -10878,32 +11532,23 @@ ipcMain.handle('upload-photo', async (event, filename_) => {
       await fs.access(filePath);
     }
 
-    const host = process.env.SFTP_HOST;
-    const username = process.env.SFTP_USERNAME;
-    const password = process.env.SFTP_PASSWORD;
-    const privateKeyPath = process.env.SFTP_PRIVATE_KEY_PATH;
-    const port = Number(process.env.SFTP_PORT || '22');
-    const remoteBasePath = process.env.SFTP_REMOTE_BASE_PATH;
-
-    if (!host || !username || (!password && !privateKeyPath) || !remoteBasePath) {
-      return {
-        success: false,
-        message: 'Config SFTP mancante. Imposta SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD o SFTP_PRIVATE_KEY_PATH, SFTP_REMOTE_BASE_PATH.'
-      };
-    }
+    const sftpConfig = await buildSftpConnectionConfig({ requireRemoteBasePath: true });
+    if (!sftpConfig.success) return sftpConfig;
 
     const sftp = new Client();
-    const config = { host, port, username };
-
-    if (password) config.password = password;
-    if (privateKeyPath) config.privateKey = await fs.readFile(privateKeyPath);
-
-    await sftp.connect(config);
-    const remotePath = path.posix.join(remoteBasePath, safeFolder, 'gallery', safeFilename);
-    await sftp.put(filePath, remotePath);
-    await sftp.end();
-
-    return { success: true, message: `Foto ${filename} caricata su ${remotePath}` };
+    try {
+      await sftp.connect(sftpConfig.config);
+      const eventContext = getCurrentEventContext();
+      const remoteFolder = eventContext && eventContext.token
+        ? path.posix.join(getSftpGalleryRemoteBasePath(), eventContext.token, 'gallery')
+        : path.posix.join(sftpConfig.remoteBasePath, safeFolder, 'gallery');
+      await sftp.mkdir(remoteFolder, true);
+      const remotePath = path.posix.join(remoteFolder, safeFilename);
+      await sftp.put(filePath, remotePath);
+      return { success: true, message: `Foto ${filename} caricata su ${remotePath}` };
+    } finally {
+      try { await sftp.end(); } catch (_) {}
+    }
   } catch (error) {
     console.error(`Errore durante l'upload di ${filename_ || filename}:`, error);
     return { success: false, message: `Errore: ${error.message}` };
@@ -10918,6 +11563,14 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ── SETTINGS IPC ────────────────────────────────────────────────────────────
+ipcMain.handle('list-sftp-events', async () => {
+  const result = await listSftpEvents();
+  if (result && result.success) {
+    schedulePhotoSyncSoon(250);
+  }
+  return result;
+});
+
 ipcMain.handle('get-save-folder', async () => {
   const p = getPhotoRootPath();
   await fs.mkdir(p, { recursive: true });
@@ -10928,6 +11581,15 @@ ipcMain.handle('set-current-event-folder', async (_event, eventName) => {
   try {
     const folder = setCurrentEventFolderName(eventName || '');
     return { success: true, folder };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('set-current-event-context', async (_event, payload) => {
+  try {
+    const context = setCurrentEventContext(payload || {});
+    return { success: true, context };
   } catch (error) {
     return { success: false, message: error.message };
   }
@@ -11047,6 +11709,7 @@ ipcMain.handle('save-captured-photo', async (_event, payload) => {
 
     const bytes = Buffer.from(b64, 'base64');
     await fs.writeFile(targetPath, bytes);
+    uploadPhotoImmediatelyAfterSave(targetPath, getCurrentEventContext());
 
     return {
       success: true,
@@ -11128,6 +11791,7 @@ app.whenReady().then(() => {
     return net.fetch('file:///' + filePath);
   });
   createWindow();
+  startPhotoSyncLoop();
 });
 
 app.on('window-all-closed', () => {

@@ -16,6 +16,8 @@
 - SFTP_USERNAME
 - SFTP_PASSWORD oppure SFTP_PRIVATE_KEY_PATH
 - SFTP_REMOTE_BASE_PATH
+- SFTP_EVENTS_REMOTE_PATH (opzionale; default: SFTP_REMOTE_BASE_PATH o `/`)
+- SFTP_GALLERY_REMOTE_BASE_PATH (opzionale; default: cartella `images/events` accanto a SFTP_EVENTS_REMOTE_PATH)
 
 ## IPC disponibili lato renderer
 
